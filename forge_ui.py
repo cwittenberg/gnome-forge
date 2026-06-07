@@ -1,4 +1,3 @@
-# gnome-forge@cwittenberg/forge_ui.py
 #!/usr/bin/env python3
 import gi
 import os
@@ -8,6 +7,7 @@ import threading
 import time
 import math
 import urllib.request
+import urllib.parse
 import re
 
 gi.require_version('Gtk', '4.0')
@@ -24,6 +24,11 @@ except (ValueError, ImportError):
         WebKit = None
 
 from gi.repository import Gtk, Gdk, GdkPixbuf, Adw, Pango, Gio, GLib
+
+try:
+    import cairo
+except ImportError:
+    pass
 
 # --- TYPOGRAPHY & DISPLAY ---
 
@@ -117,43 +122,141 @@ def ForgeIcon(icon_name="applications-engineering-symbolic", pixel_size=24, **kw
 
 # --- LAYOUT CONTAINERS ---
 
-def ForgeBox(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin=12, child=None, **kwargs):
-    kwargs.pop("size", None)
-    kwargs.pop("subtitle", None) # Protect against LLM hallucinated properties
-    box = Gtk.Box(orientation=orientation, spacing=spacing, **kwargs)
-    box.set_margin_start(margin)
-    box.set_margin_end(margin)
-    box.set_margin_top(margin)
-    box.set_margin_bottom(margin)
-    if child:
-        box.append(child)
-    return box
+class ForgeBox(Gtk.Box):
+    def __init__(self, orientation=Gtk.Orientation.VERTICAL, spacing=12, margin=12, child=None, title=None, subtitle=None, **kwargs):
+        kwargs.pop("size", None)
+        super().__init__(orientation=orientation, spacing=spacing, **kwargs)
+        self._forge_header_box = None
+        self._forge_title_label = None
+        self._forge_subtitle_label = None
+        self.set_margin_start(margin)
+        self.set_margin_end(margin)
+        self.set_margin_top(margin)
+        self.set_margin_bottom(margin)
+        if title is not None:
+            self.set_title(title)
+        if subtitle is not None:
+            self.set_subtitle(subtitle)
+        if child:
+            self.append(child)
 
-def ForgeCard(title=None, subtitle=None, orientation=Gtk.Orientation.VERTICAL, spacing=12, child=None, **kwargs):
-    kwargs.pop("size", None) 
-    box = Gtk.Box(orientation=orientation, spacing=spacing, **kwargs)
-    box.add_css_class('card')
-    box.set_margin_start(12)
-    box.set_margin_end(12)
-    box.set_margin_top(12)
-    box.set_margin_bottom(12)
-    
-    if title or subtitle:
-        header_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        header_box.set_margin_start(12)
-        header_box.set_margin_top(12)
-        if title:
-            lbl = ForgeLabel(text=title, style_class='title-2')
-            header_box.append(lbl)
-        if subtitle:
-            sub = ForgeLabel(text=subtitle)
-            sub.add_css_class('dim-label')
-            header_box.append(sub)
-        box.append(header_box)
+    def _children(self):
+        children = []
+        child = self.get_first_child()
+        while child:
+            children.append(child)
+            child = child.get_next_sibling()
+        return children
 
-    if child:
-        box.append(child)
-    return box
+    def __iter__(self):
+        return iter(self._children())
+
+    def children(self):
+        return self._children()
+
+    def clear(self):
+        for child in list(self._children()):
+            self.remove(child)
+
+    def _ensure_header(self):
+        if self._forge_header_box and self._forge_header_box.get_parent() is self:
+            return
+        self._forge_header_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        self._forge_header_box.add_css_class("forge-section-header")
+        self._forge_header_box.set_margin_bottom(6)
+        Gtk.Box.prepend(self, self._forge_header_box)
+        self._forge_title_label = None
+        self._forge_subtitle_label = None
+
+    def set_title(self, title):
+        self._ensure_header()
+        if self._forge_title_label is None or self._forge_title_label.get_parent() is None:
+            self._forge_title_label = ForgeLabel(text=title, style_class="title-2")
+            Gtk.Box.prepend(self._forge_header_box, self._forge_title_label)
+        else:
+            self._forge_title_label.set_label(str(title))
+
+    def set_subtitle(self, subtitle):
+        self._ensure_header()
+        if self._forge_subtitle_label is None or self._forge_subtitle_label.get_parent() is None:
+            self._forge_subtitle_label = ForgeLabel(text=subtitle)
+            self._forge_subtitle_label.add_css_class("dim-label")
+            self._forge_header_box.append(self._forge_subtitle_label)
+        else:
+            self._forge_subtitle_label.set_label(str(subtitle))
+
+
+class ForgeCard(Gtk.Box):
+    def __init__(self, title=None, subtitle=None, orientation=Gtk.Orientation.VERTICAL, spacing=12, child=None, **kwargs):
+        kwargs.pop("size", None)
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=spacing, **kwargs)
+        self.add_css_class('card')
+        self.set_margin_start(12)
+        self.set_margin_end(12)
+        self.set_margin_top(12)
+        self.set_margin_bottom(12)
+
+        self._forge_header_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        self._forge_header_box.set_margin_start(12)
+        self._forge_header_box.set_margin_end(12)
+        self._forge_header_box.set_margin_top(12)
+        self._forge_header_box.add_css_class("forge-card-header")
+        Gtk.Box.append(self, self._forge_header_box)
+
+        self._forge_title_label = ForgeLabel(text="", style_class='title-2')
+        self._forge_subtitle_label = ForgeLabel(text="")
+        self._forge_subtitle_label.add_css_class('dim-label')
+        self._forge_header_box.append(self._forge_title_label)
+        self._forge_header_box.append(self._forge_subtitle_label)
+
+        self._forge_content_box = Gtk.Box(orientation=orientation, spacing=spacing)
+        self._forge_content_box.set_margin_start(12)
+        self._forge_content_box.set_margin_end(12)
+        self._forge_content_box.set_margin_bottom(12)
+        Gtk.Box.append(self, self._forge_content_box)
+
+        self.set_title(title or "")
+        self.set_subtitle(subtitle or "")
+        if child:
+            self.append(child)
+
+    def _content_children(self):
+        children = []
+        child = self._forge_content_box.get_first_child()
+        while child:
+            children.append(child)
+            child = child.get_next_sibling()
+        return children
+
+    def __iter__(self):
+        return iter(self._content_children())
+
+    def children(self):
+        return self._content_children()
+
+    def append(self, child):
+        self._forge_content_box.append(child)
+
+    def prepend(self, child):
+        self._forge_content_box.prepend(child)
+
+    def remove(self, child):
+        if child.get_parent() is self._forge_content_box:
+            self._forge_content_box.remove(child)
+        else:
+            Gtk.Box.remove(self, child)
+
+    def clear(self):
+        for child in list(self._content_children()):
+            self._forge_content_box.remove(child)
+
+    def set_title(self, title):
+        self._forge_title_label.set_label(str(title))
+        self._forge_title_label.set_visible(bool(str(title)))
+
+    def set_subtitle(self, subtitle):
+        self._forge_subtitle_label.set_label(str(subtitle))
+        self._forge_subtitle_label.set_visible(bool(str(subtitle)))
 
 def ForgeRow(title="", subtitle=None, widget=None, **kwargs):
     kwargs.pop("child", None)
@@ -318,6 +421,7 @@ class ForgeNetworkImage(Gtk.Picture):
         self.load_url(url)
         
     def load_url(self, url):
+        if not url: return
         def _fetch():
             try:
                 req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
@@ -365,6 +469,16 @@ class ForgeChart(Gtk.DrawingArea):
         self.color = color
         self.set_draw_func(self._on_draw)
         self.set_size_request(300, 250)
+
+    def update_data(self, data, labels=None, title=None, color=None):
+        self.data = data
+        if labels is not None:
+            self.labels = labels
+        if title is not None:
+            self.title = title
+        if color is not None:
+            self.color = color
+        self.queue_draw()
 
     def _on_draw(self, area, cr, width, height):
         if not self.data: return
@@ -509,73 +623,6 @@ class ForgeAnimatedBackground(Gtk.Overlay):
         """Helper to act like a standard Box container if appended to."""
         self.add_overlay(widget)
 
-# --- GAME ENGINE, ACTORS, & INPUT ---
-
-class ForgeInput:
-    def __init__(self, widget):
-        self.keys = set()
-        self.ctrl = Gtk.EventControllerKey.new()
-        self.ctrl.connect("key-pressed", self._on_key_press)
-        self.ctrl.connect("key-released", self._on_key_release)
-        widget.add_controller(self.ctrl)
-        widget.set_focusable(True)
-        widget.grab_focus()
-
-    def _on_key_press(self, controller, keyval, keycode, state):
-        self.keys.add(keyval)
-        return False
-
-    def _on_key_release(self, controller, keyval, keycode, state):
-        self.keys.discard(keyval)
-        return False
-
-    def is_pressed(self, key_name):
-        keyval = Gdk.keyval_from_name(key_name)
-        return keyval in self.keys
-
-class ForgeGameLoop:
-    def __init__(self, update_func, fps=60):
-        self.update_func = update_func
-        self.interval = int(1000 / fps)
-        self.active = False
-        self._last_time = time.time()
-
-    def start(self):
-        if not self.active:
-            self.active = True
-            self._last_time = time.time()
-            GLib.timeout_add(self.interval, self._tick)
-
-    def stop(self):
-        self.active = False
-
-    def _tick(self):
-        if not self.active:
-            return False
-        current_time = time.time()
-        dt = current_time - self._last_time
-        self._last_time = current_time
-        self.update_func(dt)
-        return True
-
-class ForgeSprite:
-    def __init__(self, x=0, y=0, w=32, h=32, color=(1,0,0)):
-        self.x, self.y = x, y
-        self.w, self.h = w, h
-        self.color = color
-        self.vx, self.vy = 0, 0
-        self.active = True
-
-    def update(self, dt):
-        self.x += self.vx * dt
-        self.y += self.vy * dt
-
-    def draw(self, cr):
-        if not self.active: return
-        cr.set_source_rgb(*self.color)
-        cr.rectangle(self.x, self.y, self.w, self.h)
-        cr.fill()
-
 # --- STATE, STORAGE, & ASYNC ---
 
 def ForgeAsyncTask(task_func, callback_func):
@@ -666,3 +713,77 @@ def ask_ai(system_prompt, user_prompt, callback):
         "org.gnome.Shell.Extensions.GnomeForge", None)
         
     proxy.call("AskAI", GLib.Variant("(sss)", (call_id, system_prompt, user_prompt)), Gio.DBusCallFlags.NONE, -1, None)
+
+def fetch_web_image(query, callback):
+    """
+    Asynchronously fetches the most relevant image URL from Wikipedia given a search query.
+    """
+    def _fetch():
+        try:
+            safe_query = urllib.parse.quote(query)
+            # Fetch the most relevant article title first
+            search_url = f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={safe_query}&utf8=&format=json&srlimit=1"
+            req1 = urllib.request.Request(search_url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req1) as response1:
+                search_data = json.loads(response1.read().decode('utf-8'))
+            
+            search_results = search_data.get('query', {}).get('search', [])
+            if not search_results:
+                GLib.idle_add(lambda: callback(""))
+                return
+            
+            title = search_results[0]['title']
+            safe_title = urllib.parse.quote(title)
+            
+            # Fetch the main image for the article
+            img_url_req = f"https://en.wikipedia.org/w/api.php?action=query&prop=pageimages&format=json&piprop=original&titles={safe_title}"
+            req2 = urllib.request.Request(img_url_req, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req2) as response2:
+                img_data = json.loads(response2.read().decode('utf-8'))
+            
+            pages = img_data.get('query', {}).get('pages', {})
+            img_url = ""
+            for page_id, page_info in pages.items():
+                if 'original' in page_info:
+                    img_url = page_info['original']['source']
+                    break
+            
+            GLib.idle_add(lambda: callback(img_url))
+        except Exception as e:
+            print(f"[FORGE-UI] fetch_web_image error: {e}")
+            GLib.idle_add(lambda: callback(""))
+
+    threading.Thread(target=_fetch, daemon=True).start()
+
+def ask_ai_structured(system_prompt, user_prompt, expected_schema, callback):
+    """
+    Forces the AI to return a response adhering to a specific JSON schema,
+    allowing the UI agent to parse structured data instead of flat text.
+    """
+    schema_str = json.dumps(expected_schema, indent=2)
+    json_system_prompt = (
+        f"{system_prompt}\n\n"
+        "CRITICAL INSTRUCTION: You MUST return your response ENTIRELY as a valid JSON object. "
+        "Do not include Markdown formatting like ```json or any conversational text outside the JSON. "
+        f"Your JSON MUST strictly adhere to the following schema structure:\n{schema_str}"
+    )
+    
+    def _intercept_callback(response_text):
+        cleaned = response_text.strip()
+        if cleaned.startswith("```json"):
+            cleaned = cleaned[7:]
+        elif cleaned.startswith("```"):
+            cleaned = cleaned[3:]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+        cleaned = cleaned.strip()
+        
+        try:
+            parsed_json = json.loads(cleaned)
+        except Exception as e:
+            print(f"[FORGE-UI] Failed to parse structured AI response: {e}\nRaw Output: {response_text}")
+            parsed_json = None
+            
+        GLib.idle_add(callback, parsed_json)
+        
+    ask_ai(json_system_prompt, user_prompt, _intercept_callback)

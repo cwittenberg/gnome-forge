@@ -1,3 +1,4 @@
+// gnome-forge@cwittenberg/llm_provider.js
 import Gio from 'gi://Gio';
 
 export class OllamaProvider {
@@ -7,15 +8,25 @@ export class OllamaProvider {
     }
 
     async call(systemPrompt, userPrompt) {
+        const response = await this.chat(systemPrompt, [{ role: 'user', content: userPrompt }]);
+        return response.content || "No text returned.";
+    }
+
+    async chat(systemPrompt, messages, tools = null) {
         const endpoint = `${this.url}/api/chat`;
         const payload = {
             model: this.model,
             messages: [
                 { role: 'system', content: systemPrompt },
-                { role: 'user', content: userPrompt }
+                ...messages
             ],
             stream: false
         };
+        
+        if (tools && tools.length > 0) {
+            payload.tools = tools;
+        }
+
         return this._executeCurl(endpoint, ['Content-Type: application/json'], JSON.stringify(payload), 'ollama');
     }
 
@@ -36,9 +47,38 @@ export class OllamaProvider {
                 }
                 try {
                     const parsed = JSON.parse(stdout);
-                    if (type === 'ollama') resolve(parsed.message.content);
-                    else if (type === 'openai') resolve(parsed.choices[0].message.content);
-                    else if (type === 'gemini') resolve(parsed.candidates[0].content.parts[0].text);
+                    
+                    if (type === 'ollama') {
+                        resolve({
+                            content: parsed.message?.content || "",
+                            toolCalls: parsed.message?.tool_calls ? parsed.message.tool_calls.map(tc => ({
+                                name: tc.function.name,
+                                args: tc.function.arguments
+                            })) : null
+                        });
+                    } 
+                    else if (type === 'openai') {
+                        const msg = parsed.choices[0].message;
+                        resolve({
+                            content: msg.content || "",
+                            toolCalls: msg.tool_calls ? msg.tool_calls.map(tc => ({
+                                name: tc.function.name,
+                                args: JSON.parse(tc.function.arguments)
+                            })) : null
+                        });
+                    } 
+                    else if (type === 'gemini') {
+                        const parts = parsed.candidates[0].content.parts;
+                        let content = parts.filter(p => p.text).map(p => p.text).join('\n');
+                        let toolCalls = parts.filter(p => p.functionCall).map(p => ({
+                            name: p.functionCall.name,
+                            args: p.functionCall.args
+                        }));
+                        resolve({
+                            content: content || "",
+                            toolCalls: toolCalls.length > 0 ? toolCalls : null
+                        });
+                    }
                 } catch (e) {
                     reject(new Error(`Transport layer parsing fault: ${stdout}`));
                 }
@@ -54,6 +94,11 @@ export class OpenAIProvider {
     }
 
     async call(systemPrompt, userPrompt) {
+        const response = await this.chat(systemPrompt, [{ role: 'user', content: userPrompt }]);
+        return response.content || "No text returned.";
+    }
+
+    async chat(systemPrompt, messages, tools = null) {
         const endpoint = 'https://api.openai.com/v1/chat/completions';
         const headers = [
             'Content-Type: application/json',
@@ -63,9 +108,14 @@ export class OpenAIProvider {
             model: this.model,
             messages: [
                 { role: 'system', content: systemPrompt },
-                { role: 'user', content: userPrompt }
+                ...messages
             ]
         };
+
+        if (tools && tools.length > 0) {
+            payload.tools = tools;
+        }
+
         const ollamaInstance = new OllamaProvider({});
         return ollamaInstance._executeCurl(endpoint, headers, JSON.stringify(payload), 'openai');
     }
@@ -78,12 +128,32 @@ export class GeminiProvider {
     }
 
     async call(systemPrompt, userPrompt) {
+        const response = await this.chat(systemPrompt, [{ role: 'user', content: userPrompt }]);
+        return response.content || "No text returned.";
+    }
+
+    async chat(systemPrompt, messages, tools = null) {
         const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${this.model}:generateContent?key=${this.apiKey}`;
+        const contents = messages.map(m => ({
+            role: m.role === 'assistant' ? 'model' : 'user',
+            parts: [{ text: m.content }]
+        }));
         const payload = {
-            contents: [
-                { role: 'user', parts: [{ text: `System: ${systemPrompt}\n\nUser: ${userPrompt}` }] }
-            ]
+            system_instruction: { parts: [{ text: systemPrompt }] },
+            contents: contents
         };
+
+        if (tools && tools.length > 0) {
+            // Gemini expects a specific tools array format
+            payload.tools = [{
+                function_declarations: tools.map(t => ({
+                    name: t.function.name,
+                    description: t.function.description,
+                    parameters: t.function.parameters
+                }))
+            }];
+        }
+
         const ollamaInstance = new OllamaProvider({});
         return ollamaInstance._executeCurl(endpoint, ['Content-Type: application/json'], JSON.stringify(payload), 'gemini');
     }

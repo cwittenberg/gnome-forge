@@ -1,8 +1,8 @@
 # gnome-forge@cwittenberg/library/app_harness.py
 #!/usr/bin/env python3
 import sys
-import importlib
 import os
+import importlib
 import gi
 import inspect
 import traceback
@@ -12,12 +12,6 @@ gi.require_version('Adw', '1')
 from gi.repository import Gtk, Adw, Gio, GLib, Pango
 
 def trigger_rework(app_name, prompt):
-    def on_call_done(proxy, res, user_data):
-        try:
-            proxy.call_finish(res)
-        except Exception as e:
-            print(f"DBus Rework Trigger Failed: {e}", file=sys.stderr)
-
     try:
         bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
         proxy = Gio.DBusProxy.new_sync(bus, Gio.DBusProxyFlags.NONE, None,
@@ -25,10 +19,11 @@ def trigger_rework(app_name, prompt):
             "/org/gnome/Shell/Extensions/GnomeForge",
             "org.gnome.Shell.Extensions.GnomeForge", None)
         
-        proxy.call("ReworkApp", GLib.Variant("(ss)", (app_name, prompt)),
-                   Gio.DBusCallFlags.NONE, -1, None, on_call_done, None)
+        # Using call_sync so the DBus message completes before os._exit(0) kills the socket
+        proxy.call_sync("ReworkApp", GLib.Variant("(ss)", (app_name, prompt)),
+                   Gio.DBusCallFlags.NONE, -1, None)
     except Exception as e:
-        print(f"Failed to setup DBus Proxy: {e}", file=sys.stderr)
+        print(f"Failed to setup DBus Proxy or call ReworkApp: {e}", file=sys.stderr)
 
 class ForgeHarnessWindow(Adw.ApplicationWindow):
     def __init__(self, app_name, app_widget, **kwargs):
@@ -78,6 +73,21 @@ class ForgeHarnessWindow(Adw.ApplicationWindow):
         app_widget.set_vexpand(True)
         self.box.append(app_widget)
 
+        self.app_widget = app_widget
+        GLib.idle_add(self._optimize_focus_routing)
+        
+        self.connect("close-request", self._force_cleanup)
+
+    def _optimize_focus_routing(self):
+        if self.app_widget:
+            self.app_widget.set_focusable(True)
+            self.app_widget.grab_focus()
+        return GLib.SOURCE_REMOVE
+
+    def _force_cleanup(self, *args):
+        os._exit(0)
+        return False
+
     def on_improve_submit(self, entry):
         prompt = entry.get_text().strip()
         if prompt:
@@ -126,7 +136,7 @@ sys.excepthook = global_exception_handler
 
 class ForgeHarnessApp(Adw.Application):
     def __init__(self, app_name, **kwargs):
-        super().__init__(application_id=f"com.vibe.{app_name.lower()}", **kwargs)
+        super().__init__(application_id=f"com.vibe.{app_name.lower()}", flags=Gio.ApplicationFlags.NON_UNIQUE, **kwargs)
         self.app_name = app_name
 
     def do_activate(self):

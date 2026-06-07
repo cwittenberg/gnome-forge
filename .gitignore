@@ -1,0 +1,5 @@
+library/
+.codex/
+.agents/
+logs.txt
+gnome-forge.zip

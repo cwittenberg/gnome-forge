@@ -1,13 +1,12 @@
-// gnome-forge@cwittenberg/agent_pipeline.js
 import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
 import { getProviderInstance } from './llm_provider.js';
+import { ForgeTools } from './forge_tools.js';
 
 export class AgentPipeline {
     constructor(extensionPath, settings) {
         this._extensionPath = extensionPath;
         this._settings = settings;
-        this._lastGenerationTruncated = false;
     }
 
     _getActiveProfile() {
@@ -17,54 +16,174 @@ export class AgentPipeline {
         return profiles.find(p => p.id === activeId) || profiles[0];
     }
 
-    _extractCode(text) {
-        let extracted = text;
-        this._lastGenerationTruncated = false;
+    _readFile(filepath) {
+        let file = Gio.File.new_for_path(filepath);
+        if (!file.query_exists(null)) return "";
+        let [ok, contents] = file.load_contents(null);
+        if (ok) return new TextDecoder('utf-8').decode(contents);
+        return "";
+    }
 
-        if (text.includes('```python')) {
-            let parts = text.split('```python');
-            if (parts.length > 1) {
-                let codePart = parts[1];
-                if (!codePart.includes('```')) {
-                    console.warn("[GNOME-FORGE-WARNING] Python code block was not closed! Token limit truncation has occurred.");
-                    this._lastGenerationTruncated = true;
-                    extracted = codePart.trim();
-                } else {
-                    extracted = codePart.split('```')[0].trim();
+    _writeFile(filepath, content) {
+        let file = Gio.File.new_for_path(filepath);
+        file.replace_contents(content, null, false, Gio.FileCreateFlags.REPLACE_DESTINATION, null);
+    }
+
+    _extractPythonMethodBody(source, methodName) {
+        const escapedName = methodName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const methodRegex = new RegExp(`^(\\s*)def\\s+${escapedName}\\s*\\(`);
+        const lines = (source || "").split('\n');
+
+        for (let i = 0; i < lines.length; i++) {
+            const match = lines[i].match(methodRegex);
+            if (!match) continue;
+
+            const methodIndent = match[1].length;
+            const body = [];
+
+            for (let j = i + 1; j < lines.length; j++) {
+                const line = lines[j];
+                const trimmed = line.trim();
+                const lineIndent = line.search(/\S/);
+
+                if (trimmed && lineIndent <= methodIndent && /^(?:def|class|@|\S)/.test(line.slice(lineIndent))) {
+                    break;
                 }
+
+                body.push(line);
             }
-        } else if (text.includes('```')) {
-            let parts = text.split('```');
-            if (parts.length > 1) {
-                if (parts.length === 2 && !text.endsWith('```')) {
-                     this._lastGenerationTruncated = true;
-                }
-                extracted = parts[1].trim();
+
+            return body.join('\n');
+        }
+
+        return "";
+    }
+
+    _restartButtonTargetResetsState(source) {
+        const buttonRegex = /(?:ForgeButton|Gtk\.Button)\s*\(([^)]*(?:restart|try again|play again)[^)]*)\)/gi;
+        let match;
+
+        while ((match = buttonRegex.exec(source || "")) !== null) {
+            const args = match[1] || "";
+            const targetMatch = args.match(/on_click\s*=\s*(?:self\.)?([A-Za-z_]\w*)/);
+            if (!targetMatch) continue;
+
+            const targetName = targetMatch[1];
+            if (/^(?:restart|restart_game|reset_game|restart_callback)$/.test(targetName)) {
+                return true;
             }
-        } else {
-            extracted = text.trim();
+
+            const body = this._extractPythonMethodBody(source, targetName);
+            if (/\b(?:self\.)?(?:logic\.)?(?:reset_game|restart_game)\s*\(/.test(body) &&
+                /\bstate\s*=\s*["'](?:PLAYING|PLAY|MENU)["']/.test(body)) {
+                return true;
+            }
         }
-        
-        const lastLines = extracted.slice(-100);
-        if (lastLines.match(/["'][^"']*$/)) {
-            console.error("[GNOME-FORGE-CRITICAL] Code extraction detected a truncated generation ending in an unclosed string. The AI hit its output token limit.");
-            this._lastGenerationTruncated = true;
+
+        return false;
+    }
+
+    _formatRequirementAuditEvidence(userPrompt, appBaseName, libraryDirPath, specText = "") {
+        const files = [
+            `${appBaseName}.py`,
+            `${appBaseName}_logic.py`,
+            `${appBaseName}_ui.py`,
+        ];
+        const combined = files
+            .map((name) => this._readFile(GLib.build_filenamev([libraryDirPath, name])))
+            .join("\n\n");
+        const evidenceLines = combined
+            .split('\n')
+            .filter((line) => /restart|try again|play again|ImageSurface|SurfacePattern|set_source_surface|ForgeSprite|ForgeTextureManager|CssProvider|add_css_class|set_name|gameover|overlay/i.test(line))
+            .slice(0, 120)
+            .join('\n');
+
+        const buttonTargetResets = this._restartButtonTargetResetsState(combined);
+        const hasTextureMarker = /ForgeTextureManager\.get_cairo_surface\s*\(|get_cairo_surface\s*\(|\bForgeSprite\s*\(|image_path\s*=|set_source_surface\s*\(|\bcairo\.ImageSurface\b|\bImageSurface\s*\(|\bSurfacePattern\b/i.test(combined);
+
+        return `Current deterministic audit evidence:
+- Restart button target detected as reset-capable: ${buttonTargetResets ? 'yes' : 'no'}
+- Texture/sprite/image-surface marker detected: ${hasTextureMarker ? 'yes' : 'no'}
+
+Accepted restart fixes:
+- Prefer a dedicated \`def restart_game(self, *args):\` that calls \`self.logic.reset_game()\`, sets state back to PLAYING/PLAY, hides the game-over overlay, resets HUD-visible state, and calls \`self.grab_focus()\`.
+- Wire the visible Restart/Try Again/Play Again button directly with \`on_click=self.restart_game\`.
+
+Accepted texture fixes:
+- Create actual Cairo image surfaces or patterns, e.g. \`import cairo\`, \`self.board_texture = cairo.ImageSurface(...)\`, \`cairo.SurfacePattern(self.board_texture)\`, and draw them with \`cr.set_source_surface(...)\` or \`cr.set_source(pattern)\`.
+- Or use \`ForgeSprite(...)\`, \`ForgeTextureManager.get_cairo_surface(...)\`, or \`image_path=\`.
+- Grid lines, gradients, arcs, and colored rectangles alone do not satisfy the texture audit.
+
+Relevant current source lines:
+${evidenceLines || '(none)'}`;
+    }
+
+    async _repairRequirementAudit(llm, rescueSystem, structuredPrompt, appBaseName, targetFilename, libraryDirPath, specText, progressCallback, abortSignal, phaseStart) {
+        let auditFailures = this._auditGeneratedApp(structuredPrompt, appBaseName, libraryDirPath, specText);
+        const maxAuditRescueAttempts = 3;
+
+        for (let attempt = 1; auditFailures.length > 0 && attempt <= maxAuditRescueAttempts; attempt++) {
+            progressCallback(phaseStart, `Requirement audit failed. Dispatching Rescue Agent (${attempt}/${maxAuditRescueAttempts})...`);
+            const phaseEnd = Math.min(0.99, phaseStart + 0.04);
+            let rescuePrompt = `CRITICAL REQUIREMENT AUDIT FAILURE for ${targetFilename}.
+
+Original user prompt:
+${structuredPrompt}
+
+Audit failures:
+${auditFailures.map((failure) => `- ${failure}`).join('\n')}
+
+${this._formatRequirementAuditEvidence(structuredPrompt, appBaseName, libraryDirPath, specText)}
+
+Fix the application using apply_patch. You MUST preserve the existing AppWidget entrypoint. Do not satisfy the audit by comments or prose; the required source markers must exist in executable code. After patching, run python3 ${appBaseName}_test.py and python3 -m py_compile ${targetFilename}. Do not call finish_task until the audit failures are genuinely fixed, not merely renamed.`;
+
+            await this._runReActLoop(
+                llm,
+                rescueSystem,
+                rescuePrompt,
+                libraryDirPath,
+                (p, msg) => progressCallback(Math.min(phaseEnd, phaseStart + (p * (phaseEnd - phaseStart))), msg),
+                abortSignal,
+                `Requirement_Audit_Rescue_${attempt}`
+            );
+
+            auditFailures = this._auditGeneratedApp(structuredPrompt, appBaseName, libraryDirPath, specText);
         }
-        
-        return extracted;
+
+        return auditFailures;
+    }
+
+    _loadAgentsConfig() {
+        let filepath = GLib.build_filenamev([this._extensionPath, 'agents.json']);
+        let content = this._readFile(filepath);
+        if (!content) {
+            throw new Error("Could not read agents.json. Make sure the file exists in the extension directory.");
+        }
+        try {
+            return JSON.parse(content);
+        } catch (e) {
+            throw new Error("Failed to parse agents.json: " + e.message);
+        }
     }
 
     _deployDependencies(libraryDirPath) {
-        const filesToCopy = ['app_harness.py', 'forge_ui.py'];
+        const filesToCopy = [
+            'app_harness.py', 
+            'forge_ui.py', 
+            'forge_game_math.py', 
+            'forge_game_textures.py', 
+            'forge_game_core.py', 
+            'forge_game_entities.py', 
+            'forge_game_level.py'
+        ];
         
         for (const filename of filesToCopy) {
             const sourcePath = GLib.build_filenamev([this._extensionPath, filename]);
             const destPath = GLib.build_filenamev([libraryDirPath, filename]);
             
-            const sourceFile = Gio.File.new_for_path(sourcePath);
-            const destFile = Gio.File.new_for_path(destPath);
-            
             try {
+                const sourceFile = Gio.File.new_for_path(sourcePath);
+                const destFile = Gio.File.new_for_path(destPath);
                 sourceFile.copy(destFile, Gio.FileCopyFlags.OVERWRITE, null, null);
                 if (filename === 'app_harness.py') {
                     let info = destFile.query_info('unix::mode', Gio.FileQueryInfoFlags.NONE, null);
@@ -73,7 +192,7 @@ export class AgentPipeline {
                     destFile.set_attributes_from_info(info, Gio.FileQueryInfoFlags.NONE, null);
                 }
             } catch (e) {
-                console.warn(`[GNOME-FORGE] Could not deploy dependency ${filename}: ${e.message}`);
+                console.warn("[GNOME-FORGE] Could not deploy dependency " + filename + ": " + e.message);
             }
         }
     }
@@ -81,226 +200,482 @@ export class AgentPipeline {
     _runSubprocess(cmdArray) {
         return new Promise((resolve) => {
             try {
-                console.log(`[GNOME-FORGE] Running subprocess: ${cmdArray.join(' ')}`);
+                console.log("[GNOME-FORGE] Running subprocess: " + cmdArray.join(' '));
                 let proc = Gio.Subprocess.new(cmdArray, Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE);
                 proc.communicate_utf8_async(null, null, (obj, res) => {
                     try {
                         const [ok, out, err] = obj.communicate_utf8_finish(res);
-                        if (out) console.log(`[GNOME-FORGE-STDOUT] ${out.trim()}`);
-                        if (err) console.error(`[GNOME-FORGE-STDERR] ${err.trim()}`);
-                        resolve([ok && proc.get_successful(), out, err]);
+                        if (out) console.log("[GNOME-FORGE-STDOUT] " + out.trim());
+                        if (err) console.error("[GNOME-FORGE-STDERR] " + err.trim());
+                        resolve([ok && proc.get_successful(), out || "", err || ""]);
                     } catch (e) {
-                        console.error(`[GNOME-FORGE-ERROR] Subprocess communicate failed: ${e.message}`);
+                        console.error("[GNOME-FORGE-ERROR] Subprocess communicate failed: " + e.message);
                         resolve([false, '', e.message]);
                     }
                 });
             } catch (e) {
-                console.error(`[GNOME-FORGE-ERROR] Subprocess launch failed: ${e.message}`);
+                console.error("[GNOME-FORGE-ERROR] Subprocess launch failed: " + e.message);
                 resolve([false, '', e.message]);
             }
         });
     }
 
-    async _generateApiReflection(libraryDirPath) {
-        let pyScript = `
-import sys
-import inspect
+    _auditInvalidGtkMethodCalls(source) {
+        const constructorsByVar = new Map();
+        const assignmentRegex = /(?:self\.)?([A-Za-z_]\w*)\s*=\s*((?:Gtk|Adw)\.[A-Za-z_]\w*|Forge[A-Za-z_]\w*)\s*\(/g;
+        let assignment;
 
+        while ((assignment = assignmentRegex.exec(source || "")) !== null) {
+            constructorsByVar.set(assignment[1], assignment[2]);
+        }
+
+        const invalidByConstructor = {
+            "Gtk.Box": new Set(["set_title", "set_subtitle", "set_child", "add"]),
+            "Gtk.ScrolledWindow": new Set(["append", "add"]),
+            "Gtk.FlowBox": new Set(["add", "child_is_selected"]),
+            "Gtk.ListBox": new Set(["get_selected"]),
+        };
+        const failures = [];
+        const seen = new Set();
+
+        for (const [varName, constructor] of constructorsByVar.entries()) {
+            const invalidMethods = invalidByConstructor[constructor];
+            if (!invalidMethods) continue;
+
+            const escapedName = varName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            const callRegex = new RegExp(`(?:self\\.)?${escapedName}\\.([A-Za-z_]\\w*)\\s*\\(`, "g");
+            let call;
+
+            while ((call = callRegex.exec(source || "")) !== null) {
+                const method = call[1];
+                if (!invalidMethods.has(method)) continue;
+
+                const key = `${constructor}.${method}.${varName}`;
+                if (seen.has(key)) continue;
+                seen.add(key);
+                failures.push(`Invalid GTK method call: ${constructor} variable '${varName}' calls ${method}(), which is not valid for that widget type.`);
+            }
+        }
+
+        return failures;
+    }
+
+    _auditGeneratedApp(userPrompt, appBaseName, libraryDirPath, specText = "") {
+        const prompt = (userPrompt || "").toLowerCase();
+        const specLower = (specText || "").toLowerCase();
+        const requirementText = `${prompt}\n${specLower}`;
+        const requestedAi = /\b(ai|artificial intelligence|llm|semantic)\b/.test(prompt);
+        const requestedSearch = /\b(search|find|query|discover)\b/.test(prompt);
+        const requestedImages = /\b(image|images|picture|pictures|photo|photos|media)\b/.test(prompt);
+        const forbidsPlaceholders = /\b(no placeholders?|no mockups?|not placeholders?|not mockups?|real|actual)\b/.test(prompt);
+        const isGame = /\b(game|arcade|platformer|top-?down|fps|card game|snake|nibbles|minesweeper|mario|pong|tetris|breakout)\b/.test(requirementText) ||
+            /(?:platform_game|topdown_game|fps_game|card_game)/i.test(specText || "");
+
+        const files = [
+            `${appBaseName}.py`,
+            `${appBaseName}_logic.py`,
+            `${appBaseName}_ui.py`,
+        ];
+        const combined = files
+            .map((name) => this._readFile(GLib.build_filenamev([libraryDirPath, name])))
+            .join("\n\n");
+        const lower = combined.toLowerCase();
+        const failures = [];
+
+        if (requestedAi && requestedSearch && !/\bask_ai(?:_structured)?\s*\(/.test(combined)) {
+            failures.push("The user requested AI-powered search, but the generated app does not call ask_ai or ask_ai_structured.");
+        }
+
+        if (requestedImages && !/\bfetch_web_image\s*\(|set_from_file\s*\(|set_from_pixbuf\s*\(|set_from_paintable\s*\(/.test(combined)) {
+            failures.push("The user requested article images, but the generated app has no real image fetch/load path.");
+        }
+
+        if ((requestedAi || forbidsPlaceholders) && /\b(simulates?|dummy|mock(?:up)?|proof-of-concept|hardcoded|fallback)\b|placeholder\s+(?:for|implementation|data|content|image|ui)/.test(lower)) {
+            failures.push("The generated source contains simulation/mock/placeholder language despite explicit fidelity requirements.");
+        }
+
+        if (requestedImages && forbidsPlaceholders && /image-missing|missing image|fallback to icon|set_from_icon_name/.test(lower)) {
+            failures.push("The image implementation is fallback-only instead of providing actual article images.");
+        }
+
+        if (/\bpass\b/.test(lower)) {
+            failures.push("The generated source still contains app-specific pass statements; production app/game code must implement every declared method.");
+        }
+
+        failures.push(...this._auditInvalidGtkMethodCalls(combined));
+
+        if (isGame) {
+            const hasGameOverState = /\bgame[_ ]?over\b|GAMEOVER|game_over/i.test(combined);
+            const hasOverlay = /\bGtk\.Overlay\b|\.add_overlay\s*\(/.test(combined);
+            const hasRestartMethod = /\bdef\s+(?:restart|reset)_game\s*\(|\bdef\s+restart\s*\(|\bdef\s+reset\s*\(/.test(combined);
+            const hasRestartControl = /(?:ForgeButton|Gtk\.Button)\s*\([^)]*(?:restart|try again|play again)|\.set_label\s*\(\s*["'][^"']*(?:restart|try again|play again)/i.test(combined);
+            const hasRestartWiring = /on_click\s*=\s*(?:self\.)?(?:restart|restart_game|reset_game|restart_callback)|connect\s*\(\s*["']clicked["'][^)]*(?:restart|reset)/i.test(combined) ||
+                this._restartButtonTargetResetsState(combined);
+            const hasTexturePipeline = /ForgeTextureManager\.get_cairo_surface\s*\(|get_cairo_surface\s*\(|\bForgeSprite\s*\(|image_path\s*=|set_source_surface\s*\(|\bcairo\.ImageSurface\b|\bImageSurface\s*\(|\bSurfacePattern\b/i.test(combined);
+            const hasCustomVisualStyle = /\bGtk\.CssProvider\b|\.add_css_class\s*\(\s*["'][^"']*(?:game|arcade|hud|board|score|menu|overlay|background|title|panel|screen)[^"']*["']|\.set_name\s*\(|ForgeAnimatedBackground|LinearGradient|RadialGradient|SurfacePattern/i.test(combined);
+
+            if (!hasGameOverState || !hasOverlay) {
+                failures.push("Game output must include a visible game-over/menu overlay or screen state, not only a score label update.");
+            }
+
+            if (!hasRestartMethod || !hasRestartControl || !hasRestartWiring) {
+                failures.push("Game output must include a visible restart/play-again control wired to reset the game state.");
+            }
+
+            if (!hasCustomVisualStyle) {
+                failures.push("Game output must include an intentional visual template/background/HUD style, not bare default GTK plus a flat canvas.");
+            }
+
+            if (!hasTexturePipeline) {
+                failures.push("Game output must use sprites, loaded textures, or generated Cairo image-surface textures for the board/entities/background.");
+            }
+        }
+
+        return failures;
+    }
+
+    async _generateApiReflection(libraryDirPath) {
+        const pyScript = `import sys
+import inspect
 sys.path.insert(0, '${libraryDirPath}')
 
 try:
     import forge_ui
+    import forge_game_math
+    import forge_game_textures
+    import forge_game_core
+    import forge_game_entities
+    import forge_game_level
     import gi
     gi.require_version('Gtk', '4.0')
     from gi.repository import Gtk
 
-    output = "DYNAMIC FORGE_UI API REFLECTION:\\n"
+    output = "DYNAMIC API REFLECTION:\\n"
     
-    for name, obj in inspect.getmembers(forge_ui):
-        if inspect.isclass(obj) and name.startswith('Forge'):
-            methods = [m[0] for m in inspect.getmembers(obj) if not m[0].startswith('_')]
-            output += f"- {name}: Valid Methods -> {', '.join(methods)}\\n"
-        elif inspect.isfunction(obj) and name.startswith('Forge'):
-            sig = inspect.signature(obj)
-            output += f"- {name}{sig}\\n"
+    modules = [
+        (forge_ui, 'forge_ui'), 
+        (forge_game_math, 'forge_game_math'), 
+        (forge_game_textures, 'forge_game_textures'),
+        (forge_game_core, 'forge_game_core'),
+        (forge_game_entities, 'forge_game_entities'),
+        (forge_game_level, 'forge_game_level')
+    ]
+    
+    for module, mod_name in modules:
+        output += f"\\n--- {mod_name} ---\\n"
+        for name, obj in inspect.getmembers(module):
+            if inspect.isclass(obj) and name.startswith('Forge'):
+                try:
+                    sig = str(inspect.signature(obj.__init__)).replace('(self, ', '(').replace('(self)', '()')
+                    output += "- " + name + sig + ": "
+                except Exception:
+                    output += "- " + name + ": "
+                
+                method_strings = []
+                for m_name, m_obj in inspect.getmembers(obj):
+                    if not m_name.startswith('_') and inspect.isroutine(m_obj):
+                        try:
+                            m_sig = str(inspect.signature(m_obj)).replace('(self, ', '(').replace('(self)', '()')
+                            method_strings.append(m_name + m_sig)
+                        except Exception:
+                            method_strings.append(m_name)
+                
+                output += "Valid Methods -> " + ", ".join(method_strings) + "\\n"
+            elif inspect.isfunction(obj) and (name.startswith('Forge') or name.startswith('fetch_') or name.startswith('ask_')):
+                sig = inspect.signature(obj)
+                output += "- " + name + str(sig) + "\\n"
 
-    output += "\\nGTK4 ANTI-HALLUCINATION RULES (CRITICAL):\\n"
-    output += "- Gtk.FlowBox: MUST use get_selected_children(), NEVER child_is_selected().\\n"
-    output += "- Gtk.FlowBox: MUST use append(), NEVER add().\\n"
-    output += "- Gtk.ListBox: MUST use get_selected_row(), NEVER get_selected().\\n"
-    output += "- Gtk.Box: MUST use append(), NEVER set_child().\\n"
-    output += "- Gtk.ScrolledWindow: MUST use set_child(), NEVER add() or append().\\n"
-    output += "- Gtk.EventControllerKey: Connect to 'key-pressed' and return bool (True to stop propagation).\\n"
-    
+    output += """
+GTK4 & FORGE ANTI-HALLUCINATION RULES:
+- GTK Focus Loss: If you remove a Main Menu to show the Game, the app loses focus! You MUST call self.grab_focus() on the game container immediately after removing the menu so ForgeInput continues to capture keys.
+- Drawing Area Collapse: ForgeDrawingArea will shrink to 0x0 if not explicitly sized. You MUST call drawing_area.set_size_request(800, 600) to ensure it is visible.
+- Mutable Titles: Raw Gtk.Box has no set_title() or set_subtitle(). Use ForgeCard(title=..., subtitle=...) or ForgeBox(title=..., subtitle=...) for titled panels; both expose set_title(), set_subtitle(), clear(), and safe child iteration.
+- ForgeRaycaster: For 3D First-Person games, use ForgeRaycaster.render(cr, map_data, px, py, dir_x, dir_y, plane_x, plane_y, width, height, colors) in your draw_func to simulate 3D.
+- ForgeCardItem: For Card games, instantiate ForgeCardItem(suit, value, x, y, face_up) and call .draw(cr) inside your draw_func.
+- ForgeInput: Initialize with self.input = ForgeInput(self) inside AppWidget. Use self.input.is_pressed("w") to check keys. The widget receiving the controller MUST call set_focusable(True) and grab_focus() to actually receive key events.
+- ForgeMouse: Initialize with ForgeMouse(self) inside AppWidget. Provides continuous self.mouse.x and self.mouse.y tracking and self.mouse.is_pressed() functionality.
+- ForgeGameLoop: Constructor is (update_func, fps=60). MUST pass update function positionally or as update_func=. The update_func MUST accept a 'dt' (delta time) argument. If drawing graphics, you MUST call self.drawing_area.queue_draw() inside your update_func so the screen refreshes!
+- FORGE_GAME: To build games, you MUST import classes from the modular components (e.g., from forge_game_textures import ForgeTextureManager, from forge_game_core import ForgeGameLoop, etc).
+- ForgeTileMap Physics: For platformers, encode every solid floor, wall, and platform as positive values in the ForgeTileMap grid. After actor.update(dt), call tile_map.resolve_physics(actor). This resolves tile collisions on both axes, updates actor.is_grounded, and clamps actors to tilemap bounds. Use clamp_bottom=False only for intentional death pits and then handle fall death explicitly.
+- ForgeSprite: NOT a Gtk.Widget. NEVER append it to a container. To render it, create a ForgeDrawingArea(draw_func=...), append the drawing area to your layout, and call sprite.draw(cr) inside the draw_func. To use textures, pass a valid URL or Path to image_path.
+- GTK LAYOUT: Root AppWidget, major panels, AND game/drawing areas MUST call set_hexpand(True) and set_vexpand(True) so they dynamically fill the screen. NEVER leave them unexpanded.
+- ask_ai(system_prompt, user_prompt, callback): Asynchronously queries the active LLM. The callback MUST accept exactly ONE argument (the string response).
+- ask_ai_structured(system_prompt, user_prompt, expected_schema, callback): Forces AI to return JSON matching expected_schema (a python dict). Callback receives a parsed Python dict/list. USE THIS for rich dashboards!
+- fetch_web_image(query, callback): Asynchronously fetches an image URL based on a search query. Callback takes one string argument (the URL). USE THIS FOR ENCYCLOPEDIAS OR DATA DASHBOARDS!
+- AppWidget Scoping: All CSS styling (Gtk.CssProvider), Keyboard Controllers (ForgeInput), and Mouse Tracking (ForgeMouse) MUST be applied directly to the AppWidget class. CRITICAL: AppWidget MUST have a parameterless constructor: def __init__(self):
+"""
     print(output)
 except Exception as e:
-    print(f"CRITICAL FORGE_UI API DEFINITIONS (Fallback Mode):\\n- ForgeMarkdown: set_markdown(text)\\n- ForgeNetworkImage: load_url(url)\\n- ask_ai(system_prompt, user_prompt, callback)\\nError: {e}")
+    print("CRITICAL FORGE_UI API DEFINITIONS (Fallback):\\nError: " + str(e))
 `;
         let [ok, out, err] = await this._runSubprocess(['python3', '-c', pyScript]);
         return ok ? out.trim() : out.trim() || err.trim();
     }
 
+    async _runReActLoop(llm, systemPrompt, initialMessage, workspacePath, progressCallback, abortSignal, agentName) {
+        let messages = [{ role: 'user', content: initialMessage }];
+        let maxSteps = 30; // Enough runway for generation and repair without runaway correction loops.
+        let toolsInstance = new ForgeTools(workspacePath);
+        let schemas = toolsInstance.getToolSchemas();
+
+        console.warn(`\n========== [DEBUG GNOME-FORGE] PIPELINE INIT: ${agentName} ==========`);
+        console.warn(`[SYSTEM PROMPT]\n${systemPrompt}\n`);
+
+        for (let i = 0; i < maxSteps; i++) {
+            if (abortSignal && abortSignal.cancelled) throw new Error("Cancelled by user");
+            progressCallback(0.2 + (i * 0.03), "[" + agentName + "] Analyzing & Executing Tool (Iter " + (i+1) + ")...");
+
+            console.warn(`\n--- [DEBUG GNOME-FORGE] ${agentName} TURN ${i+1} INPUT ---`);
+            console.warn(messages[messages.length - 1].content);
+
+            let response = await llm.chat(systemPrompt, messages, schemas);
+            let assistantLog = response.content || "";
+
+            console.warn(`\n--- [DEBUG GNOME-FORGE] ${agentName} TURN ${i+1} RAW OUTPUT ---`);
+            console.warn(`Content: ${assistantLog}`);
+            if (response.toolCalls) {
+                console.warn(`Tool Calls: ${JSON.stringify(response.toolCalls, null, 2)}`);
+            }
+
+            if (!response.toolCalls || response.toolCalls.length === 0) {
+                messages.push({ role: 'assistant', content: assistantLog });
+                messages.push({ 
+                    role: 'user', 
+                    content: "SYSTEM FATAL: No native tool call detected. You MUST execute an action using a tool in every turn. Do not just output text." 
+                });
+                continue;
+            }
+
+            let toolCall = response.toolCalls[0];
+            let tool = toolCall.name;
+            let args = toolCall.args || {};
+            
+            console.log("[GNOME-FORGE-AGENT] " + agentName + " executing Tool: " + tool);
+
+            if (tool === 'finish_task') {
+                return args.final_output || "Agent " + agentName + " finished successfully.";
+            }
+
+            let result = await toolsInstance.executeTool(tool, args);
+
+            assistantLog += `\n[Invoked Native Tool: ${tool} with args: ${JSON.stringify(args)}]`;
+            messages.push({ role: 'assistant', content: assistantLog.trim() });
+            
+            messages.push({ 
+                role: 'user', 
+                content: `TOOL RESULT:\n${result}\n\nAnalyze this output. If your patch or bash command failed, you must correct it immediately. Use read_file or list_files if you lack context. If your goal is met and everything is functioning correctly, you MUST call 'finish_task' to conclude the loop.` 
+            });
+        }
+
+        throw new Error("Agent [" + agentName + "] exceeded maximum ReAct loops without finishing.");
+    }
+
     async execute(userPrompt, notifyCallback, progressCallback, successCallback, abortSignal) {
-        console.log(`[GNOME-FORGE] Starting Agent Pipeline execution`);
+        console.log("[GNOME-FORGE] Booting Sequential & Diff Pipeline");
         const profile = this._getActiveProfile();
         if (!profile) {
-            throw new Error('No LLM profiles match configuration keys. Open settings panel.');
+            throw new Error("No LLM profiles match configuration keys. Open settings panel.");
         }
-        
+
+        const agentsConfig = this._loadAgentsConfig();
         const llm = getProviderInstance(profile);
         const libraryDirPath = GLib.build_filenamev([this._extensionPath, 'library']);
         GLib.mkdir_with_parents(libraryDirPath, 0o755);
         
         this._deployDependencies(libraryDirPath);
-        this._lastGenerationTruncated = false;
 
         let originalCode = '';
         let appBaseName = '';
         let structuredPrompt = userPrompt;
+        let isRework = false;
 
         if (abortSignal && abortSignal.cancelled) throw new Error("Cancelled by user");
-        progressCallback(0.05, 'Reflecting on API & Workspace...');
+        progressCallback(0.05, "Reflecting on GTK API constraints...");
         
         const FORGE_API_DOCS = await this._generateApiReflection(libraryDirPath);
-        console.log(`[GNOME-FORGE] Dynamic API Reflection Generated.`);
 
         if (userPrompt.startsWith('Rework')) {
             let parts = userPrompt.split(':');
             if (parts.length >= 2) {
-                let filename = parts[0].replace('Rework', '').trim();
+                appBaseName = parts[0].replace('Rework', '').trim();
                 structuredPrompt = parts.slice(1).join(':').trim();
-                let filepath = GLib.build_filenamev([libraryDirPath, filename + '.py']);
+                let filepath = GLib.build_filenamev([libraryDirPath, appBaseName + '.py']);
+                originalCode = this._readFile(filepath);
                 
-                let file = Gio.File.new_for_path(filepath);
-                if (file.query_exists(null)) {
-                    let [ok, contents] = file.load_contents(null);
-                    if (ok) {
-                        originalCode = new TextDecoder().decode(contents);
-                        try {
-                            let bakpath = GLib.build_filenamev([libraryDirPath, filename + '.py.bak']);
-                            let bakfile = Gio.File.new_for_path(bakpath);
-                            file.copy(bakfile, Gio.FileCopyFlags.OVERWRITE, null, null);
-                        } catch (e) {
-                            console.warn(`[GNOME-FORGE] Could not create backup for ${filename}: ${e.message}`);
-                        }
+                if (originalCode) {
+                    isRework = true;
+                    try {
+                        let bakpath = GLib.build_filenamev([libraryDirPath, appBaseName + '.py.bak']);
+                        this._writeFile(bakpath, originalCode);
+                    } catch (e) {
+                        console.warn("[GNOME-FORGE] Could not create backup for " + appBaseName + ": " + e.message);
                     }
                 }
-                appBaseName = filename;
             }
         }
 
-        // --- STAGE 1: ARCHITECTURE CRITIC ---
-        if (abortSignal && abortSignal.cancelled) throw new Error("Cancelled by user");
-        progressCallback(0.1, `Critic structuring application components...`);
-
-        let criticSys = `You are a visionary Systems Architect. The user requested an application or improvement. 
-CRITICAL MANDATES: 
-1. STRICT CONSTRAINT PRESERVATION: Incorporate all specific constraints.
-2. COMPONENT DECOUPLING: You MUST enforce a strict separation between UI layout and Data/Logic. Instruct the Engineer to NEVER embed large dictionaries, lists, or hardcoded text datasets. 
-3. PREVENT TOKEN TRUNCATION: All complex data, encyclopedias, or bulk content MUST be fetched dynamically using the 'ask_ai' function. Static embedding causes catastrophic token limits and syntax errors.
-4. UI/UX: Enforce dynamic layout (set_hexpand, set_vexpand). For keyboards/calculators, mandate Gtk.EventControllerKey.
-Output ONLY the expanded, structured technical specification for the engineering agents.`;
-        
-        let criticUserPrompt = originalCode ? `IMPROVEMENT REQUEST:\n${structuredPrompt}\n\nEXISTING CODE:\n${originalCode}` : structuredPrompt;
-        let expandedSpec = await llm.call(criticSys, criticUserPrompt);
-
-        // --- STAGE 2: UI SKELETON ENGINEER ---
-        if (abortSignal && abortSignal.cancelled) throw new Error("Cancelled by user");
-        progressCallback(0.2, `Building UI skeleton via ${profile.name}...`);
-        
-        let uiSys = `You are an elite GTK4 UI Engineer. Phase 1: Build the UI skeleton.
-1. Create a PascalCase app name. Define EXACTLY \`class AppWidget(Gtk.Box):\`.
-2. Build the FULL GTK4 user interface based on the spec. Include all widgets, layouts, and CSS.
-3. DO NOT IMPLEMENT COMPLEX LOGIC YET. Wire buttons to empty methods (e.g., \`def on_click(self, btn): pass\`).
-4. NEVER embed massive text or datasets.
-5. NO markdown text. Output ONLY the raw Python code.
-${FORGE_API_DOCS}`;
-        
-        let uiDraftResponse = await llm.call(uiSys, `SPECIFICATION:\n${expandedSpec}\n\nBASE CODE:\n${originalCode}`);
-        let uiDraftCode = this._extractCode(uiDraftResponse);
-
-        // --- STAGE 3: LOGIC IMPLEMENTATION ENGINEER ---
-        if (abortSignal && abortSignal.cancelled) throw new Error("Cancelled by user");
-        progressCallback(0.35, `Wiring application logic...`);
-
-        let logicSys = `You are an elite GTK4 Logic Engineer. Phase 2: Implement the logic for the provided UI skeleton.
-1. Take the provided skeleton code and implement ALL empty methods, event handlers, and data logic.
-2. DO NOT embed datasets. Fetch data dynamically using \`ask_ai(system_prompt, user_prompt, callback)\`.
-3. Implement keyboard navigation via Gtk.EventControllerKey if applicable.
-4. Return the FULL, unabridged, completed Python file. DO NOT USE placeholders like "rest of code unchanged". You must output the entire file from top to bottom.
-5. Multiline strings (CSS, prompts) MUST use triple quotes (""").
-${FORGE_API_DOCS}`;
-
-        let logicResponse = await llm.call(logicSys, `SPECIFICATION:\n${expandedSpec}\n\nUI SKELETON:\n${uiDraftCode}`);
-        let finalCode = this._extractCode(logicResponse);
-        
         if (!appBaseName) {
-            let nameMatch = finalCode.match(/class\s+([A-Za-z0-9_]+)\(Gtk\.Box\):/);
-            appBaseName = nameMatch ? "AppWidget" : `${structuredPrompt.split(' ')[0].replace(/[^a-zA-Z]/g, '')}App`;
-            let topNameMatch = finalCode.match(/APP_NAME:\s*([A-Za-z0-9]+)/);
-            if (topNameMatch) appBaseName = topNameMatch[1];
+            appBaseName = structuredPrompt.split(' ')[0].replace(/[^a-zA-Z]/g, '') + "App_" + Date.now();
         }
+        const targetFilename = appBaseName + ".py";
 
-        // --- STAGE 4: QA & API AUDITOR ---
+        const agentBaseSystem = agentsConfig.base_system
+            .replace('{FORGE_API_DOCS}', FORGE_API_DOCS);
+
+        const getSystemPrompt = (roleKey) => {
+            return agentsConfig[roleKey]
+                .replace('{base_system}', agentBaseSystem)
+                .replace(/\{targetFilename\}/g, targetFilename)
+                .replace(/\{appBaseName\}/g, appBaseName)
+                .replace(/\{originalPrompt\}/g, structuredPrompt);
+        };
+
         if (abortSignal && abortSignal.cancelled) throw new Error("Cancelled by user");
-        progressCallback(0.5, `Auditing against GTK4 API Reflection...`);
 
-        let qaSys = `You are a strict GTK4 API Auditor. Evaluate the code against the reflected API.
-1. Does it call hallucinatory methods like \`child_is_selected\` on a FlowBox? FAIL IT and fix it (use \`get_selected_children()\`).
-2. Does it use \`.set_child()\` on a Gtk.Box? FAIL IT and use \`.append()\`.
-3. Did the AI embed massive hardcoded dictionaries? FAIL IT and replace with \`ask_ai\` logic.
-4. Scan for unterminated string literals or broken multiline strings.
-${FORGE_API_DOCS}
-If perfect and 100% compliant, output exactly "PASS". Otherwise, output the FULL unabridged corrected Python code.`;
-        
-        let qaResponse = await llm.call(qaSys, `CODE:\n${finalCode}`);
-        let cleanedQa = this._extractCode(qaResponse);
+        let specContent = '';
+        let expansionText = '';
 
-        if (!cleanedQa.includes('PASS') && cleanedQa.length > 50) {
-            finalCode = cleanedQa;
-            if (abortSignal && abortSignal.cancelled) throw new Error("Cancelled by user");
-            progressCallback(0.55, `Applying API Auditor corrections...`);
-        }
-
-        // --- STAGE 5: COMPILATION & INSTANTIATION CHECK (REPAIR LOOP) ---
-        let maxAttempts = 3;
-        let attempt = 1;
-        let success = false;
-
-        while (attempt <= maxAttempts && !success) {
-            if (abortSignal && abortSignal.cancelled) throw new Error("Cancelled by user");
-            progressCallback(0.6 + (attempt * 0.1), `Validating safe instantiation (Attempt ${attempt}/${maxAttempts})...`);
+        if (!isRework) {
+            progressCallback(0.1, "Planner Agent expanding requirements into a full app spec...");
+            let plannerSystem = getSystemPrompt('planner_agent');
+            let plannerPrompt = `The user requested: '${structuredPrompt}'.\nExpand this into a detailed technical and UX specification in ${appBaseName}_spec.txt. CRITICAL: Put a SUCCESS CRITERIA section near the top of the spec before implementation details. These criteria define what DONE means and must be testable by QA and visible to UI/design/code agents before they write code. Provide clear categorizations (UTILITY, DASHBOARD, PLATFORM_GAME, TOPDOWN_GAME, FPS_GAME, or CARD_GAME) and adhere to their constraints. Define the strict interface classes and methods so UI and Logic components can be developed in parallel without overlapping. Preserve explicit requirements as acceptance tests; never rewrite AI/search/images/no-placeholders into keyword search, dummy data, fallback icons, or proof-of-concept behavior.`;
             
-            let tempTargetFile = GLib.build_filenamev([libraryDirPath, `${appBaseName}.py`]);
-            let tempFile = Gio.File.new_for_path(tempTargetFile);
-            tempFile.replace_contents(finalCode, null, false, Gio.FileCreateFlags.REPLACE_DESTINATION, null);
+            await this._runReActLoop(llm, plannerSystem, plannerPrompt, libraryDirPath, progressCallback, abortSignal, 'Planner_Agent');
 
-            let [compileOk, compileOut, compileErr] = await this._runSubprocess(['python3', '-m', 'py_compile', tempTargetFile]);
-            
-            if (!compileOk) {
-                console.error(`[GNOME-FORGE-ERROR] Syntax compilation failed: ${compileErr}`);
-                if (abortSignal && abortSignal.cancelled) throw new Error("Cancelled by user");
-                progressCallback(0.75, `Executing autonomous repair for Syntax Error...`);
+            specContent = this._readFile(GLib.build_filenamev([libraryDirPath, `${appBaseName}_spec.txt`]));
+            expansionText = specContent ? `\n\nDETAILED SPECIFICATION TO FOLLOW:\n${specContent}` : `\n\nUSER PROMPT:\n${structuredPrompt}`;
 
-                let truncationDirective = this._lastGenerationTruncated ? 
-                    "\nCRITICAL: Code truncated due to token limits. You MUST delete massive hardcoded data dictionaries. DO NOT just add a quote to the end of the broken file. Rewrite the file completely to be shorter and functional." : "";
+            const isGame = /PLATFORM_GAME|TOPDOWN_GAME|FPS_GAME|CARD_GAME/.test(specContent);
+            const deterministicGameAuditContract = `\n\nDETERMINISTIC GAME AUDIT CONTRACT:
+- Implement a dedicated \`restart_game(self, *args)\` method in AppWidget that calls the logic reset method, returns the game to PLAYING/PLAY, hides the game-over overlay, resets visible HUD state where needed, and calls \`self.grab_focus()\`.
+- Wire the visible Game Over button directly as \`ForgeButton(label="Restart"\` or \`"Try Again"\`, \`on_click=self.restart_game\`). A restart-labeled button wired only to an unrelated callback is likely to fail audit.
+- Use a real texture/sprite/image-surface code path for board/entities/background. At least one executable marker must be present and used during rendering: \`cairo.ImageSurface(...)\`, \`ImageSurface(...)\`, \`cairo.SurfacePattern(...)\`, \`SurfacePattern(...)\`, \`cr.set_source_surface(...)\`, \`ForgeSprite(...)\`, \`ForgeTextureManager.get_cairo_surface(...)\`, or \`image_path=\`.
+- Colored rectangles, arcs, grid lines, and comments saying "sprite" are not enough; generate a small procedural Cairo surface in code if no asset exists.`;
 
-                let testSys = `CRITICAL FAILURE DETECTED. You are a Python GTK4 Debugging Agent.
-Error Log:
-${compileErr}
-${truncationDirective}
+            let uiAgentSystem, logicAgentSystem, uiPrompt, logicPrompt;
 
-1. Analyze the syntax error.
-2. If fixing an unterminated string, do NOT output just the fixed line. You MUST output the FULL, UNABRIDGED file from imports to the final class method. No partial responses.
-3. DO NOT drop existing UI functionality.`;
-                let finalCodeResponse = await llm.call(testSys, finalCode);
-                finalCode = this._extractCode(finalCodeResponse);
-                attempt++;
-                continue;
+            if (isGame) {
+                uiAgentSystem = getSystemPrompt('game_ux_agent');
+                logicAgentSystem = getSystemPrompt('gameplay_agent');
+                uiPrompt = `Design the complete 2D/3D game rendering interface based on this specification: ${expansionText}${deterministicGameAuditContract}\nOutput your draft to ${appBaseName}_ui.py. First read the SUCCESS CRITERIA section and treat it as the checklist for done. Import required classes from forge_game_core, forge_game_entities, forge_game_math, forge_game_level, forge_game_textures. Use ForgeDrawingArea for rendering. You MUST capture mouse input via ForgeMouse and keyboard input via ForgeInput. Ensure self.drawing_area.set_size_request(800, 600) is called. You MUST include a Main Menu and Game Over screen overlay (Gtk.Overlay) to start/stop the game, including a visible Restart/Try Again button wired to the reset/restart method. You MUST build a themed visual shell with CSS classes or names, HUD/score areas, and a non-flat background. You MUST use textured rendering for the board/entities/background via ForgeSprite, ForgeTextureManager, image_path sprites, Cairo ImageSurface/SurfacePattern, or generated PNG textures. Sound is optional/deferred for now and must not block completion. You MUST instantiate and apply ForgeCamera when world/camera rendering is appropriate. Follow the API contract provided in the specification.`;
+                logicPrompt = `Design the complete 2D/3D gameplay mechanics, physics, and ForgeGameLoop logic based on this specification: ${expansionText}\nOutput your draft to ${appBaseName}_logic.py. First read the SUCCESS CRITERIA section and treat it as the checklist for done. Import required classes from forge_game_core, forge_game_entities, forge_game_math, forge_game_level, forge_game_textures. Include enemies, triggers, and state appropriate to the game type. Read mouse/keyboard inputs passed from the UI. You MUST implement a state machine (MENU, PLAY, GAMEOVER) plus reset_game/restart_game semantics that restore score, entities, timers, and direction/input state. You SHOULD expose event flags or callbacks for scoring/collection, start/restart, collision, and game over for UI effects, but sound is optional/deferred for now. You MUST implement boundary checks appropriate to the game type to trigger Game Over. Follow the API contract provided in the specification.`;
+            } else {
+                uiAgentSystem = getSystemPrompt('ui_agent');
+                logicAgentSystem = getSystemPrompt('logic_agent');
+                uiPrompt = `Design the complete, fully-wired GTK4 UI interface based on this specification: ${expansionText}\nOutput your draft to ${appBaseName}_ui.py. Read the specification to determine if this is a UTILITY or DASHBOARD and layout components appropriately. Follow the API contract provided in the specification.`;
+                logicPrompt = `Design the complete backend data structures, dynamic fetchers, and calculation logic based on this specification: ${expansionText}\nOutput your draft to ${appBaseName}_logic.py. Implement real AI calls with ask_ai or ask_ai_structured whenever the specification asks for AI, semantic search, generated articles, dynamic discovery, or dashboard intelligence. Implement image retrieval with fetch_web_image whenever the specification asks for remote or article images. Do not label keyword matching, hardcoded entries, dummy data, or fallback icons as fulfilling AI/image requirements. Follow the API contract provided in the specification.`;
             }
 
-            let dryRunScript = `
-import sys
+            // Architecture fix: Execute sequential code generation instead of parallel to preserve context
+            progressCallback(0.2, "Executing Logic generation sequentially...");
+            
+            await this._runReActLoop(llm, logicAgentSystem, logicPrompt, libraryDirPath, (p, msg) => progressCallback(0.2 + (p * 0.2), "[Logic] " + msg), abortSignal, isGame ? 'Gameplay_Agent' : 'Logic_Agent');
+
+            if (abortSignal && abortSignal.cancelled) throw new Error("Cancelled by user");
+            
+            progressCallback(0.4, "Executing UI generation sequentially...");
+            let sequentialUiPrompt = uiPrompt + `\n\nCRITICAL: The logic engineer has just finished writing ${appBaseName}_logic.py. Use read_file to read it FIRST, then implement the UI to seamlessly connect to its classes/methods.`;
+            await this._runReActLoop(llm, uiAgentSystem, sequentialUiPrompt, libraryDirPath, (p, msg) => progressCallback(0.4 + (p * 0.2), "[UI] " + msg), abortSignal, isGame ? 'Game_UX_Agent' : 'UI_Agent');
+
+            if (abortSignal && abortSignal.cancelled) throw new Error("Cancelled by user");
+            progressCallback(0.6, "Merge Agent integrating outputs...");
+
+            let mergeSystem = getSystemPrompt('merge_agent');
+            let mergePrompt = `Start the merging process for ${targetFilename} based on the original specification: '${expansionText}'. ${isGame ? deterministicGameAuditContract : ''}\nYou MUST ensure that the final code is a FULLY functional app/game (no placeholders) and fulfills the SUCCESS CRITERIA plus all stylistic, graphical, texture, restart, overlay, and input requirements. For games, explicitly verify a visible restart/play-again control wired to reset state, non-flat textured rendering, and an intentional styled HUD/background/template. Sound is optional/deferred for now and must not block completion. Verify that 'class AppWidget(Gtk.Box):' is the entrypoint. Cleanly import the generated companion modules as needed; ${appBaseName}_logic.py and ${appBaseName}_ui.py are runtime artifacts and will remain on disk.`;
+            
+            await this._runReActLoop(llm, mergeSystem, mergePrompt, libraryDirPath, progressCallback, abortSignal, 'Merge_Agent');
+
+            if (isGame) {
+                progressCallback(0.68, "Running deterministic requirement audit before QA...");
+                const rescueSystem = getSystemPrompt('rescue_agent');
+                const preQaAuditFailures = await this._repairRequirementAudit(
+                    llm,
+                    rescueSystem,
+                    structuredPrompt,
+                    appBaseName,
+                    targetFilename,
+                    libraryDirPath,
+                    specContent || expansionText,
+                    progressCallback,
+                    abortSignal,
+                    0.69
+                );
+
+                if (preQaAuditFailures.length > 0) {
+                    throw new Error("Pipeline Failed Pre-QA Requirement Audit:\n" + preQaAuditFailures.join("\n"));
+                }
+            }
+
+        } else {
+            progressCallback(0.15, "Coordinator Agent dispatching sequential rework thread...");
+            let reworkSystem = getSystemPrompt('rework_agent');
+            let reworkPrompt = `IMPROVEMENT REQUEST: ${structuredPrompt}\n\nCURRENT FILE STATE (${targetFilename}):\n\`\`\`python\n${originalCode}\n\`\`\`\n\nModify '${targetFilename}' appropriately using the apply_patch tool. DO NOT write the file from scratch if you can avoid it.`;
+
+            await this._runReActLoop(llm, reworkSystem, reworkPrompt, libraryDirPath, progressCallback, abortSignal, 'Rework_Agent');
+            expansionText = `\n\nIMPROVEMENT REQUEST:\n${structuredPrompt}`;
+        }
+
+        if (abortSignal && abortSignal.cancelled) throw new Error("Cancelled by user");
+        
+        progressCallback(0.75, "QA Agent writing & executing automated UI integration tests...");
+        let qaSystem = getSystemPrompt('qa_agent');
+        let qaPrompt = `The application ${targetFilename} has been merged. Read it and write a comprehensive integration test script to ${appBaseName}_test.py using the write_file tool.
+
+ORIGINAL SPECIFICATION TO VALIDATE AGAINST:
+${expansionText}
+
+CRITICAL MANDATES FOR THE TEST SCRIPT:
+1. To prevent infinite loops or hanging threads, you MUST use os._exit(0) and os._exit(1) inside your test script rather than sys.exit() or app.quit(). GTK loops swallow sys.exit() and will cause the pipeline to hang and timeout.
+2. After writing the file, you MUST use run_bash_command to execute it (python3 ${appBaseName}_test.py).
+3. If the script fails, read the traceback, patch the test OR patch ${targetFilename}, and run the bash command again.
+4. You MUST read the Original Specification above and write assertions in your test script to verify that BOTH stylistic (e.g., CSS classes) and functional (e.g., ForgeInput bindings, ForgeMouse presence) requirements were actually implemented.
+5. For interactive apps, exercise the primary interaction path by calling the search/submit/activate handler directly or emitting/clicking the relevant button after filling a test query. Callback-only AttributeErrors are release-blocking failures.
+6. If this is a GAME, the test MUST inspect source and/or widget attributes to fail when any of these are missing: visible restart/play-again control wired to reset state, Game Over/menu overlay, non-flat visual style/CSS/HUD/background, and texture/sprite/image-surface usage for entities or the board. Sound is optional/deferred for now and must not be a failing assertion.
+7. You are NOT ALLOWED to call finish_task until the bash command succeeds with Exit Code 0.
+8. In GTK4, Gtk.main() and Gtk.main_quit() DO NOT EXIST. Do not use them. Run your tests in a headless manner: initialize the app, connect activate to your test logic, call app.register(), and step the GLib context manually using GLib.MainContext.default().iteration(False) iteratively to prevent the test suite from hanging on app.run(None).`;
+        
+        await this._runReActLoop(llm, qaSystem, qaPrompt, libraryDirPath, progressCallback, abortSignal, 'QA_Agent');
+
+        let auditFailures = this._auditGeneratedApp(structuredPrompt, appBaseName, libraryDirPath, specContent || expansionText);
+        if (auditFailures.length > 0) {
+            let rescueSystem = getSystemPrompt('rescue_agent');
+            auditFailures = await this._repairRequirementAudit(
+                llm,
+                rescueSystem,
+                structuredPrompt,
+                appBaseName,
+                targetFilename,
+                libraryDirPath,
+                specContent || expansionText,
+                progressCallback,
+                abortSignal,
+                0.82
+            );
+
+            if (auditFailures.length > 0) {
+                throw new Error("Pipeline Failed Requirement Audit:\n" + auditFailures.join("\n"));
+            }
+        }
+
+        // Final native QA pass as a safety net
+        progressCallback(0.85, "Performing final native QA verification pass...");
+        let [testOk, testOut, testErr] = await this._runSubprocess(['bash', '-c', `cd "${libraryDirPath}" && python3 ${appBaseName}_test.py`]);
+
+        if (!testOk) {
+            progressCallback(0.9, "Native QA Verification failed. Dispatching Rescue Agent...");
+            let rescueSystem = getSystemPrompt('rescue_agent');
+            let rescuePrompt = `CRITICAL FAILURE during automated QA testing of ${targetFilename}.\n\nTest Output/Traceback:\n${testErr || testOut}\n\nAnalyze the traceback. Fix the code using apply_patch. You MUST use run_bash_command to execute python3 ${appBaseName}_test.py to verify your fix. DO NOT call finish_task until your fix exits cleanly.`;
+            
+            await this._runReActLoop(llm, rescueSystem, rescuePrompt, libraryDirPath, progressCallback, abortSignal, 'Rescue_Agent');
+            
+            let [retryOk, retryOut, retryErr] = await this._runSubprocess(['bash', '-c', `cd "${libraryDirPath}" && python3 ${appBaseName}_test.py`]);
+            if (!retryOk) {
+                throw new Error("Pipeline Failed Final QA Rescue Test:\n" + (retryErr || retryOut));
+            }
+        }
+
+        progressCallback(0.95, "Auditing instantiation & GTK compliance safety...");
+        const dryRunScript = `import sys
 import traceback
 import gi
 gi.require_version('Gtk', '4.0')
@@ -310,68 +685,65 @@ sys.path.insert(0, '${libraryDirPath}')
 
 try:
     import ${appBaseName}
-    print("[GNOME-FORGE-DRYRUN] Module loaded successfully.")
-    
     if hasattr(${appBaseName}, 'AppWidget'):
         widget = ${appBaseName}.AppWidget()
         if not isinstance(widget, Gtk.Box):
-            raise Exception("Developer Error: AppWidget MUST inherit from Gtk.Box, but found " + type(widget).__name__)
-        print("[GNOME-FORGE-DRYRUN] AppWidget instantiated successfully.")
+            raise Exception('AppWidget MUST inherit from Gtk.Box')
     else:
-        raise Exception("Developer Error: Generated code is explicitly missing 'class AppWidget(Gtk.Box):'")
-        
+        raise Exception('Missing class AppWidget(Gtk.Box):')
 except Exception as e:
     print(traceback.format_exc(), file=sys.stderr)
     sys.exit(1)
-sys.exit(0)
-            `;
+sys.exit(0)`;
 
-            let [importOk, importOut, importErr] = await this._runSubprocess(['python3', '-c', dryRunScript]);
+        let [importOk, importOut, importErr] = await this._runSubprocess(['python3', '-c', dryRunScript]);
 
-            if (!importOk) {
-                console.error(`[GNOME-FORGE-ERROR] GTK instantiation dry-run failed: ${importErr}`);
-                if (abortSignal && abortSignal.cancelled) throw new Error("Cancelled by user");
-                progressCallback(0.75, `Executing autonomous repair for Instantiation Error...`);
-                
-                let testSys = `CRITICAL FAILURE DETECTED. You are a Python GTK4 Debugging Agent.
-Error Log:
-${importErr}
-
-${FORGE_API_DOCS}
-
-1. Analyze the trace. Check the API REFLECTION above to ensure you are not hallucinating a method.
-2. Output the FULLY CORRECTED, UNABRIDGED Python code wrapped in exactly one \`\`\`python ... \`\`\` block. DO NOT USE PLACEHOLDERS like 'rest of code unchanged'.
-3. DO NOT drop functionality.`;
-                let finalCodeResponse = await llm.call(testSys, finalCode);
-                finalCode = this._extractCode(finalCodeResponse);
-                attempt++;
-                continue;
+        if (!importOk) {
+            progressCallback(0.97, "Instantiation failed. Dispatching Rescue Agent...");
+            let rescueSystem = getSystemPrompt('rescue_agent');
+            let rescuePrompt = `CRITICAL FAILURE during GTK test of ${targetFilename}:\n${importErr}\nFix this immediately via apply_patch. Use run_bash_command to test the dry-run script.`;
+            
+            await this._runReActLoop(llm, rescueSystem, rescuePrompt, libraryDirPath, progressCallback, abortSignal, 'Rescue_Agent');
+            
+            let [retryOk, retryOut, retryErr] = await this._runSubprocess(['python3', '-c', dryRunScript]);
+            if (!retryOk) {
+                throw new Error("Pipeline Failed Final GTK Rescue Test:\n" + retryErr);
             }
-
-            success = true;
-            console.log(`[GNOME-FORGE] QA and Validation successful!`);
-            if (abortSignal && abortSignal.cancelled) throw new Error("Cancelled by user");
-            progressCallback(0.9, `Validation complete. Pipeline Passed!`);
         }
 
-        if (!success) {
-            throw new Error(`CRITICAL FAILURE: Application failed validation after ${maxAttempts} repair iterations.`);
+        let finalAuditFailures = this._auditGeneratedApp(structuredPrompt, appBaseName, libraryDirPath, specContent || expansionText);
+        if (finalAuditFailures.length > 0) {
+            let rescueSystem = getSystemPrompt('rescue_agent');
+            finalAuditFailures = await this._repairRequirementAudit(
+                llm,
+                rescueSystem,
+                structuredPrompt,
+                appBaseName,
+                targetFilename,
+                libraryDirPath,
+                specContent || expansionText,
+                progressCallback,
+                abortSignal,
+                0.98
+            );
+
+            if (finalAuditFailures.length > 0) {
+                throw new Error("Pipeline Failed Final Requirement Audit:\n" + finalAuditFailures.join("\n"));
+            }
         }
 
-        if (abortSignal && abortSignal.cancelled) throw new Error("Cancelled by user");
-        progressCallback(0.95, 'Compiling and saving final component...');
+        try {
+            let specArtifact = Gio.File.new_for_path(GLib.build_filenamev([libraryDirPath, appBaseName + "_spec.txt"]));
+            let testArtifact = Gio.File.new_for_path(GLib.build_filenamev([libraryDirPath, appBaseName + "_test.py"]));
+            if (specArtifact.query_exists(null)) specArtifact.delete(null);
+            if (testArtifact.query_exists(null)) testArtifact.delete(null);
+        } catch (e) {
+            console.warn("[GNOME-FORGE] Minor cleanup issue: " + e.message);
+        }
 
-        let header = `"""\nGNOME FORGE COMPONENT\nOriginal Prompt: ${structuredPrompt}\n"""\n\n`;
-        let ultimateCode = header + finalCode;
-
-        let targetFile = GLib.build_filenamev([libraryDirPath, `${appBaseName}.py`]);
-        let file = Gio.File.new_for_path(targetFile);
-        
-        file.replace_contents(ultimateCode, null, false, Gio.FileCreateFlags.REPLACE_DESTINATION, null);
-        
-        console.log(`[GNOME-FORGE] Pipeline finished saving ${appBaseName}.py`);
+        console.log("[GNOME-FORGE] Pipeline finished saving " + targetFilename);
         if (abortSignal && abortSignal.cancelled) throw new Error("Cancelled by user");
-        progressCallback(1.0, 'Wiring finished. Execution ready!');
+        progressCallback(1.0, "Wiring finished. Execution ready!");
         
         successCallback(appBaseName);
     }

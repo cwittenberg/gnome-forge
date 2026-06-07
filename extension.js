@@ -603,7 +603,13 @@ class ForgeIndicator extends PanelMenu.Button {
         let info;
         while ((info = enumerator.next_file(null)) !== null) {
             let name = info.get_name();
-            if (name.endsWith('.py') && name !== 'app_harness.py' && name !== 'forge_ui.py') {
+            // FILTER FIX: Ignore all forge_ dependencies and any intermediate agent artifacts
+            if (name.endsWith('.py') && 
+                name !== 'app_harness.py' && 
+                !name.startsWith('forge_') && 
+                !name.endsWith('_ui.py') && 
+                !name.endsWith('_logic.py') && 
+                !name.endsWith('_test.py')) {
                 let appBaseName = name.replace('.py', '');
                 let displayName = appBaseName.replace(/_/g, ' ');
                 displayName = displayName.replace(/\b\w/g, l => l.toUpperCase());
