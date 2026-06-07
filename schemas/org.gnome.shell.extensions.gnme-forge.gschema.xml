@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.gnome-forge" path="/org/gnome/shell/extensions/gnome-forge/">
+    <key name="active-profile-id" type="s">
+      <default>'default-ollama'</default>
+      <summary>Currently active LLM profile ID</summary>
+    </key>
+    <key name="llm-profiles" type="s">
+      <default>'[{"id":"default-ollama","name":"Local Ollama","provider":"ollama","url":"http://localhost:11434","model":"llama3","apiKey":""}]'</default>
+      <summary>Serialized JSON string containing all user-configured profiles</summary>
+    </key>
+  </schema>
+</schemalist>

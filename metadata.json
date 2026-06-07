@@ -1,0 +1,14 @@
+{
+  "name": "GNOME Forge: Vibe App Engine",
+  "description": "Generate, test, run, and library-store full interactive applications instantly from a single prompt using multi-agent local or remote AI workflows.",
+  "uuid": "gnome-forge@cwittenberg",
+  "shell-version": [
+    "45",
+    "46",
+    "47",
+    "48",
+    "50"
+  ],
+  "url": "https://github.com/cwittenberg/gnome-forge",
+  "settings-schema": "org.gnome.shell.extensions.gnome-forge"
+}
