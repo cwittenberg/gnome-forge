@@ -1,17 +1,18 @@
+// forge_tools.js
 import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
+import { TextureGenerator } from './texture_generator.js';
 
 export class ForgeTools {
-    constructor(workspacePath) {
+    constructor(workspacePath, llmProvider = null) {
         this.workspacePath = workspacePath;
+        this.llm = llmProvider;
         
-        // Define the native execution logic
         this.tools = {
             "write_file": async (args) => {
                 let path = GLib.build_filenamev([this.workspacePath, args.file]);
                 let file = Gio.File.new_for_path(path);
                 
-                // Unescape accidentally over-escaped quotes from LLM JSON output to prevent Syntax errors
                 let content = args.content.replace(/\\"/g, '"').replace(/\\'/g, "'");
                 
                 file.replace_contents(content, null, false, Gio.FileCreateFlags.REPLACE_DESTINATION, null);
@@ -36,6 +37,52 @@ export class ForgeTools {
                 }
                 return `FILES IN DIRECTORY:\n${files.join('\n')}`;
             },
+            "generate_texture": async (args) => {
+                if (!this.llm) return "FAILURE: No LLM provider attached to tools.";
+                let prompt = `You are an expert texture JSON recipe generator. The user wants: "${args.description}".
+Respond ONLY with a raw JSON object (no markdown, no backticks).
+The JSON must follow one of these schemas:
+1. Pixel Art (Good for 2D sprites, retro FPS, pixel icons):
+{
+  "type": "pixel_art",
+  "width": 64,
+  "height": 64,
+  "background": "#00000000",
+  "palette": { "X": "#FF0000FF", "O": "#000000FF", " ": null },
+  "pixels": [
+    "  XX  ",
+    " XOOX ",
+    " XOOX ",
+    "  XX  "
+  ]
+}
+2. Gradient (Good for skies, backgrounds):
+{
+  "type": "gradient",
+  "width": 128,
+  "height": 128,
+  "direction": "vertical",
+  "stops": [{"offset": 0, "color": "#87CEEBFF"}, {"offset": 1, "color": "#1E90FFFF"}],
+  "noise": 0.05
+}
+3. Shapes (Good for basic objects, metals, bricks):
+{
+  "type": "shapes",
+  "width": 64,
+  "height": 64,
+  "background": "#808080FF",
+  "noise": 0.1,
+  "shapes": [
+    {"type": "rect", "x": 0, "y": 0, "w": 32, "h": 32, "color": "#909090FF"},
+    {"type": "circle", "cx": 16, "cy": 16, "r": 8, "color": "#404040FF"}
+  ]
+}`;
+                let recipeJson = await this.llm.call(prompt, "Generate JSON recipe for: " + args.description);
+                recipeJson = recipeJson.replace(/```json/g, '').replace(/```/g, '').trim();
+                
+                let path = GLib.build_filenamev([this.workspacePath, args.file]);
+                return TextureGenerator.render(recipeJson, path);
+            },
             "apply_patch": async (args) => {
                 let path = GLib.build_filenamev([this.workspacePath, args.file]);
                 let file = Gio.File.new_for_path(path);
@@ -44,18 +91,15 @@ export class ForgeTools {
                 if (!ok) return `FAILURE: Could not read ${args.file}.`;
                 let content = new TextDecoder('utf-8').decode(contents);
                 
-                // Unescape accidentally over-escaped quotes from LLM JSON output
                 let oldText = args.old_text.replace(/\\"/g, '"').replace(/\\'/g, "'");
                 let newText = args.new_text.replace(/\\"/g, '"').replace(/\\'/g, "'");
 
-                // 1. Try exact replacement first
                 if (content.includes(oldText)) {
                     let newContent = content.replace(oldText, newText);
                     file.replace_contents(newContent, null, false, Gio.FileCreateFlags.REPLACE_DESTINATION, null);
                     return `SUCCESS: Exact string match replaced in ${args.file}.`;
                 }
 
-                // 2. Try line-by-line whitespace-normalized match
                 let oldLines = oldText.trim().split('\n').map(l => l.trim());
                 let contentLines = content.split('\n');
                 
@@ -95,7 +139,6 @@ export class ForgeTools {
                     return `SUCCESS: Line-by-line semantic diff applied to ${args.file}.`;
                 }
 
-                // 3. Fallback to fuzzy word pattern matching
                 let escapeRegExp = (string) => string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
                 let fuzzyPattern = oldText.trim().split(/\s+/).map(escapeRegExp).join('\\s+');
                 let regex = new RegExp(fuzzyPattern);
@@ -111,14 +154,12 @@ export class ForgeTools {
                 return `FAILURE: The exact string in 'old_text' was not found in ${args.file}. The system utilizes normalized whitespace matching, but the target text still missed. Ensure you capture the exact syntax of the target block (avoid over-escaping quotes or mismatched line breaks).\n\nContextual Snippet from file:\n...\n${snippet}\n...\n\nPlease use read_file to check the exact state or use write_file to replace the entire document cleanly.`;
             },
             "run_bash_command": async (args) => {
-                // Added `exec` so that python replaces the bash process. This ensures force_exit() kills the actual app, not just the bash wrapper.
                 let cmdArray = ['bash', '-c', `cd "${this.workspacePath}" && exec ${args.command}`];
                 let proc = Gio.Subprocess.new(cmdArray, Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE);
                 
                 return new Promise((resolve) => {
                     let isResolved = false;
                     
-                    // Increased timeout to 15 seconds to allow GTK tests to run. 
                     let timeoutId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 15, () => {
                         if (!isResolved) {
                             isResolved = true;
@@ -153,7 +194,6 @@ export class ForgeTools {
         };
     }
 
-    // Native JSON Schema format expected by OpenAI/Ollama APIs
     getToolSchemas() {
         return [
             {
@@ -196,6 +236,21 @@ export class ForgeTools {
                             directory: { type: "string", description: "The directory to list. Defaults to the current workspace root." }
                         },
                         required: []
+                    }
+                }
+            },
+            {
+                type: "function",
+                function: {
+                    name: "generate_texture",
+                    description: "Generates a PNG texture image based on a semantic description using an LLM JSON recipe and a local JS rendering engine. Use this to create any required game assets instead of hardcoding python arrays.",
+                    parameters: {
+                        type: "object",
+                        properties: {
+                            file: { type: "string", description: "The local filename to write the PNG to (e.g. assets/player.png)." },
+                            description: { type: "string", "description": "A detailed visual description of the texture (e.g. 'retro 90s FPS wolfenstein guard pixel art sprite')." }
+                        },
+                        required: ["file", "description"]
                     }
                 }
             },

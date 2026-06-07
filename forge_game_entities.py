@@ -59,6 +59,33 @@ class ForgeEntity:
 class ForgeSprite(ForgeEntity):
     def __init__(self, x=0, y=0, w=32, h=32, color=(1,0,0), image_path=None, emoji=None):
         super().__init__(x, y, w, h, color, image_path, emoji)
+
+class ForgeAnimatedSprite(ForgeSprite):
+    def __init__(self, x=0, y=0, w=32, h=32, frames=None, fps=5):
+        super().__init__(x, y, w, h)
+        self.frames = frames or []
+        self.anim_fps = fps
+        self.anim_timer = 0.0
+        self.current_frame = 0
+
+    def update(self, dt):
+        super().update(dt)
+        if self.frames and self.anim_fps > 0:
+            self.anim_timer += dt
+            if self.anim_timer >= 1.0 / self.anim_fps:
+                self.anim_timer = 0
+                self.current_frame = (self.current_frame + 1) % len(self.frames)
+                # Ensure compatibility with 3D raycaster
+                self.texture_id = self.frames[self.current_frame]
+
+class ForgeItem(ForgeEntity):
+    def __init__(self, x=0, y=0, w=0.5, h=0.5, item_type="ammo", amount=10, image_path=None, emoji="📦"):
+        super().__init__(x, y, w, h, color=(0,1,0), image_path=image_path, emoji=emoji)
+        self.item_type = item_type
+        self.amount = amount
+
+    def on_pickup(self, player):
+        self.active = False
         
 class ForgeActor(ForgeEntity):
     def __init__(self, x=0, y=0, w=32, h=32, health=100, faction="neutral", color=(1,0,0), image_path=None, emoji=None):

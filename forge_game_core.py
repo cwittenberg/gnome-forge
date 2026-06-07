@@ -14,6 +14,7 @@ class ForgeInput:
     def __init__(self, widget):
         self.widget = widget
         self.pressed_keys = set()
+        self._just_pressed_keys = set()
         self.last_key = None
         self.controller = Gtk.EventControllerKey()
         self.controller.connect("key-pressed", self._on_key_pressed)
@@ -61,14 +62,19 @@ class ForgeInput:
 
     def _on_key_pressed(self, controller, keyval, keycode, state):
         names = self._key_names(keyval)
+        for name in names:
+            if name not in self.pressed_keys:
+                self._just_pressed_keys.add(name)
         self.pressed_keys.update(names)
         self.last_key = next(iter(names))
-        return False
+        # Consume the event so GTK doesn't use it for spatial UI navigation
+        return True
 
     def _on_key_released(self, controller, keyval, keycode, state):
         for name in self._key_names(keyval):
             self.pressed_keys.discard(name)
-        return False
+        # Consume the event
+        return True
 
     def is_pressed(self, key):
         return self._normalize(key) in self.pressed_keys
@@ -76,11 +82,20 @@ class ForgeInput:
     def is_down(self, key):
         return self.is_pressed(key)
 
+    def is_just_pressed(self, key):
+        """Edge detection: Returns True exactly once per key press, auto-consuming the state. Perfect for grid movement."""
+        norm = self._normalize(key)
+        if norm in self._just_pressed_keys:
+            self._just_pressed_keys.remove(norm)
+            return True
+        return False
+
     def any_pressed(self, *keys):
         return any(self.is_pressed(key) for key in keys)
 
     def clear(self):
         self.pressed_keys.clear()
+        self._just_pressed_keys.clear()
         self.last_key = None
 
 class ForgeMouse:
@@ -111,6 +126,9 @@ class ForgeMouse:
         self.x = float(x)
         self.y = float(y)
         self.buttons.add(gesture.get_current_button())
+        # Ensure we reclaim keyboard focus when the player clicks the game area
+        if hasattr(self.widget, "grab_focus"):
+            self.widget.grab_focus()
 
     def _on_released(self, gesture, n_press, x, y):
         self.x = float(x)
@@ -255,8 +273,14 @@ class ForgeGameLoop:
         current_time = GLib.get_monotonic_time()
         dt = (current_time - self.last_time) / 1000000.0
         self.last_time = current_time
-        result = self.update_func(dt)
-        return True if result is None else bool(result)
+        try:
+            result = self.update_func(dt)
+            return True if result is None else bool(result)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            # Return True to keep the GLib timeout alive, preventing the game from freezing entirely on a single frame exception
+            return True
 
     def stop(self):
         if self._source_id:

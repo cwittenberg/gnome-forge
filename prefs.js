@@ -1,9 +1,13 @@
 // gnome-forge@cwittenberg/prefs.js
 import Adw from 'gi://Adw';
 import Gio from 'gi://Gio';
+import Gdk from 'gi://Gdk';
 import Gtk from 'gi://Gtk';
 import GLib from 'gi://GLib';
 import { ExtensionPreferences } from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
+
+const OPEN_FORGE_SHORTCUT = 'open-forge-shortcut';
+const DEFAULT_OPEN_FORGE_SHORTCUT = '<Super>y';
 
 export default class ForgePreferences extends ExtensionPreferences {
     fillPreferencesWindow(window) {
@@ -17,6 +21,7 @@ export default class ForgePreferences extends ExtensionPreferences {
         this._log('Preferences Window Initialized');
 
         // Explicitly set groups to null before initial render
+        this._shortcutGroup = null;
         this._activeGroup = null;
         this._listGroup = null;
         this._addGroup = null;
@@ -65,22 +70,147 @@ export default class ForgePreferences extends ExtensionPreferences {
         this._settings.set_string('llm-profiles', JSON.stringify(profiles));
     }
 
+    _getOpenShortcut() {
+        const shortcuts = this._settings.get_strv(OPEN_FORGE_SHORTCUT);
+        return shortcuts.length > 0 ? shortcuts[0] : '';
+    }
+
+    _shortcutLabelText() {
+        const shortcut = this._getOpenShortcut();
+        if (!shortcut) return 'Disabled';
+
+        try {
+            const [ok, keyval, modifiers] = Gtk.accelerator_parse(shortcut);
+            if (ok) {
+                return Gtk.accelerator_get_label(keyval, modifiers) || shortcut;
+            }
+        } catch (e) {
+        }
+        return shortcut;
+    }
+
+    _isModifierKey(keyval) {
+        return [
+            Gdk.KEY_Control_L,
+            Gdk.KEY_Control_R,
+            Gdk.KEY_Shift_L,
+            Gdk.KEY_Shift_R,
+            Gdk.KEY_Alt_L,
+            Gdk.KEY_Alt_R,
+            Gdk.KEY_Meta_L,
+            Gdk.KEY_Meta_R,
+            Gdk.KEY_Super_L,
+            Gdk.KEY_Super_R,
+            Gdk.KEY_Hyper_L,
+            Gdk.KEY_Hyper_R,
+        ].includes(keyval);
+    }
+
+    _addShortcutRow() {
+        const row = new Adw.ActionRow({
+            title: 'Open Forge Prompt',
+            subtitle: 'Opens the tray and focuses the vibe field.'
+        });
+
+        let capturing = false;
+        const shortcutLabel = new Gtk.Label({
+            label: this._shortcutLabelText(),
+            min_width_chars: 14
+        });
+        const shortcutButton = new Gtk.Button({
+            child: shortcutLabel,
+            valign: Gtk.Align.CENTER
+        });
+
+        const refreshLabel = () => {
+            shortcutLabel.set_label(capturing ? 'Press keys...' : this._shortcutLabelText());
+        };
+
+        shortcutButton.connect('clicked', () => {
+            capturing = true;
+            refreshLabel();
+            shortcutButton.grab_focus();
+        });
+
+        const keyController = new Gtk.EventControllerKey();
+        keyController.connect('key-pressed', (_controller, keyval, _keycode, state) => {
+            if (!capturing) return false;
+
+            if (keyval === Gdk.KEY_Escape) {
+                capturing = false;
+                refreshLabel();
+                return true;
+            }
+
+            if (keyval === Gdk.KEY_BackSpace || keyval === Gdk.KEY_Delete) {
+                this._settings.set_strv(OPEN_FORGE_SHORTCUT, []);
+                capturing = false;
+                refreshLabel();
+                this._log('Open shortcut disabled');
+                return true;
+            }
+
+            if (this._isModifierKey(keyval)) {
+                return true;
+            }
+
+            const modifiers = state & Gtk.accelerator_get_default_mod_mask();
+            const isFunctionKey = keyval >= Gdk.KEY_F1 && keyval <= Gdk.KEY_F35;
+            if (modifiers === 0 && !isFunctionKey) {
+                shortcutLabel.set_label('Add a modifier');
+                return true;
+            }
+
+            if (!Gtk.accelerator_valid(keyval, modifiers)) {
+                shortcutLabel.set_label('Invalid shortcut');
+                return true;
+            }
+
+            const accelerator = Gtk.accelerator_name(keyval, modifiers);
+            this._settings.set_strv(OPEN_FORGE_SHORTCUT, [accelerator]);
+            capturing = false;
+            refreshLabel();
+            this._log(`Open shortcut changed to ${accelerator}`);
+            return true;
+        });
+        shortcutButton.add_controller(keyController);
+
+        const resetButton = new Gtk.Button({
+            icon_name: 'edit-undo-symbolic',
+            tooltip_text: `Reset to ${DEFAULT_OPEN_FORGE_SHORTCUT}`,
+            valign: Gtk.Align.CENTER
+        });
+        resetButton.connect('clicked', () => {
+            this._settings.set_strv(OPEN_FORGE_SHORTCUT, [DEFAULT_OPEN_FORGE_SHORTCUT]);
+            capturing = false;
+            refreshLabel();
+            this._log(`Open shortcut reset to ${DEFAULT_OPEN_FORGE_SHORTCUT}`);
+        });
+
+        row.add_suffix(shortcutButton);
+        row.add_suffix(resetButton);
+        this._shortcutGroup.add(row);
+    }
+
     _renderUI() {
         this._isUpdatingUI = true;
         this._log('Rebuilding UI interface...');
 
         // Cleanly remove existing groups from the page (this avoids corrupting Adw.PreferencesGroup internal list boxes)
+        if (this._shortcutGroup) this._page.remove(this._shortcutGroup);
         if (this._activeGroup) this._page.remove(this._activeGroup);
         if (this._listGroup) this._page.remove(this._listGroup);
         if (this._addGroup) this._page.remove(this._addGroup);
         if (this._debugGroup) this._page.remove(this._debugGroup);
 
         // Re-instantiate fresh groups
+        this._shortcutGroup = new Adw.PreferencesGroup({ title: 'Panel Shortcut' });
         this._activeGroup = new Adw.PreferencesGroup({ title: 'Active Engine Routing' });
         this._listGroup = new Adw.PreferencesGroup({ title: 'Configured LLM Profiles' });
         this._addGroup = new Adw.PreferencesGroup();
         this._debugGroup = new Adw.PreferencesGroup({ title: 'Live System Debug Log' });
 
+        this._page.add(this._shortcutGroup);
         this._page.add(this._activeGroup);
         this._page.add(this._listGroup);
         this._page.add(this._addGroup);
@@ -90,6 +220,8 @@ export default class ForgePreferences extends ExtensionPreferences {
         const activeId = this._settings.get_string('active-profile-id');
 
         this._log(`Loaded ${profiles.length} profiles from disk. Active ID: ${activeId}`);
+
+        this._addShortcutRow();
 
         // --- ACTIVE PROFILE DROPDOWN ---
         if (profiles.length > 0) {

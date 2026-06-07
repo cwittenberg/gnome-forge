@@ -1,3 +1,4 @@
+// agent_pipeline.js
 import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
 import { getProviderInstance } from './llm_provider.js';
@@ -94,25 +95,31 @@ export class AgentPipeline {
             .join("\n\n");
         const evidenceLines = combined
             .split('\n')
-            .filter((line) => /restart|try again|play again|ImageSurface|SurfacePattern|set_source_surface|ForgeSprite|ForgeTextureManager|CssProvider|add_css_class|set_name|gameover|overlay/i.test(line))
+            .filter((line) => /restart|try again|play again|ImageSurface|SurfacePattern|set_source_surface|ForgeSprite|ForgeTextureManager|CssProvider|add_css_class|set_name|style_class|gameover|overlay|hud|menu/i.test(line))
             .slice(0, 120)
             .join('\n');
 
         const buttonTargetResets = this._restartButtonTargetResetsState(combined);
-        const hasTextureMarker = /ForgeTextureManager\.get_cairo_surface\s*\(|get_cairo_surface\s*\(|\bForgeSprite\s*\(|image_path\s*=|set_source_surface\s*\(|\bcairo\.ImageSurface\b|\bImageSurface\s*\(|\bSurfacePattern\b/i.test(combined);
+        const hasTextureMarker = /\bget_cairo_surface\s*\(|\bForgeSprite\s*\(|image_path\s*=|set_source_surface\s*\(|\bcairo\.ImageSurface\b|\bImageSurface\s*\(|\bSurfacePattern\b/i.test(combined);
+        const hasVisualStyleMarker = /\bGtk\.CssProvider\b|\.add_css_class\s*\(\s*["'][^"']*(?:game|arcade|hud|board|score|menu|overlay|background|title|panel|screen)[^"']*["']|\.set_name\s*\(|ForgeAnimatedBackground|LinearGradient|RadialGradient|SurfacePattern/i.test(combined);
 
         return `Current deterministic audit evidence:
 - Restart button target detected as reset-capable: ${buttonTargetResets ? 'yes' : 'no'}
 - Texture/sprite/image-surface marker detected: ${hasTextureMarker ? 'yes' : 'no'}
+- Visual style marker detected: ${hasVisualStyleMarker ? 'yes' : 'no'}
 
 Accepted restart fixes:
 - Prefer a dedicated \`def restart_game(self, *args):\` that calls \`self.logic.reset_game()\`, sets state back to PLAYING/PLAY, hides the game-over overlay, resets HUD-visible state, and calls \`self.grab_focus()\`.
 - Wire the visible Restart/Try Again/Play Again button directly with \`on_click=self.restart_game\`.
 
 Accepted texture fixes:
-- Create actual Cairo image surfaces or patterns, e.g. \`import cairo\`, \`self.board_texture = cairo.ImageSurface(...)\`, \`cairo.SurfacePattern(self.board_texture)\`, and draw them with \`cr.set_source_surface(...)\` or \`cr.set_source(pattern)\`.
-- Or use \`ForgeSprite(...)\`, \`ForgeTextureManager.get_cairo_surface(...)\`, or \`image_path=\`.
+- Use the \`generate_texture\` tool to create PNGs and load them with \`ForgeTextureManager.get_cairo_surface(...)\`, or \`image_path=\`.
 - Grid lines, gradients, arcs, and colored rectangles alone do not satisfy the texture audit.
+
+Accepted visual-style fixes:
+- Add executable GTK style markers in \`AppWidget.__init__\`: create \`self.css_provider = Gtk.CssProvider()\`, load CSS rules for game UI regions, register it only when \`Gdk.Display.get_default()\` returns a display, and call \`add_css_class\` or \`set_name\` on the game shell, overlay, HUD, menu, and game-over overlay.
+- Recommended class names: \`game-shell\`, \`game-overlay\`, \`game-hud\`, \`game-menu\`, \`game-over-screen\`, and \`game-title\`.
+- Cairo-only decoration, comments, and \`ForgeLabel(style_class="title")\` are not enough; the generated source must include audit-visible \`Gtk.CssProvider\`, \`add_css_class\`, or \`set_name\` calls.
 
 Relevant current source lines:
 ${evidenceLines || '(none)'}`;
@@ -311,7 +318,7 @@ Fix the application using apply_patch. You MUST preserve the existing AppWidget 
             const hasRestartControl = /(?:ForgeButton|Gtk\.Button)\s*\([^)]*(?:restart|try again|play again)|\.set_label\s*\(\s*["'][^"']*(?:restart|try again|play again)/i.test(combined);
             const hasRestartWiring = /on_click\s*=\s*(?:self\.)?(?:restart|restart_game|reset_game|restart_callback)|connect\s*\(\s*["']clicked["'][^)]*(?:restart|reset)/i.test(combined) ||
                 this._restartButtonTargetResetsState(combined);
-            const hasTexturePipeline = /ForgeTextureManager\.get_cairo_surface\s*\(|get_cairo_surface\s*\(|\bForgeSprite\s*\(|image_path\s*=|set_source_surface\s*\(|\bcairo\.ImageSurface\b|\bImageSurface\s*\(|\bSurfacePattern\b/i.test(combined);
+            const hasTexturePipeline = /\bget_cairo_surface\s*\(|\bForgeSprite\s*\(|image_path\s*=|set_source_surface\s*\(|\bcairo\.ImageSurface\b|\bImageSurface\s*\(|\bSurfacePattern\b/i.test(combined);
             const hasCustomVisualStyle = /\bGtk\.CssProvider\b|\.add_css_class\s*\(\s*["'][^"']*(?:game|arcade|hud|board|score|menu|overlay|background|title|panel|screen)[^"']*["']|\.set_name\s*\(|ForgeAnimatedBackground|LinearGradient|RadialGradient|SurfacePattern/i.test(combined);
 
             if (!hasGameOverState || !hasOverlay) {
@@ -389,19 +396,14 @@ try:
 GTK4 & FORGE ANTI-HALLUCINATION RULES:
 - GTK Focus Loss: If you remove a Main Menu to show the Game, the app loses focus! You MUST call self.grab_focus() on the game container immediately after removing the menu so ForgeInput continues to capture keys.
 - Drawing Area Collapse: ForgeDrawingArea will shrink to 0x0 if not explicitly sized. You MUST call drawing_area.set_size_request(800, 600) to ensure it is visible.
-- Mutable Titles: Raw Gtk.Box has no set_title() or set_subtitle(). Use ForgeCard(title=..., subtitle=...) or ForgeBox(title=..., subtitle=...) for titled panels; both expose set_title(), set_subtitle(), clear(), and safe child iteration.
-- ForgeRaycaster: For 3D First-Person games, use ForgeRaycaster.render(cr, map_data, px, py, dir_x, dir_y, plane_x, plane_y, width, height, colors) in your draw_func to simulate 3D.
-- ForgeCardItem: For Card games, instantiate ForgeCardItem(suit, value, x, y, face_up) and call .draw(cr) inside your draw_func.
-- ForgeInput: Initialize with self.input = ForgeInput(self) inside AppWidget. Use self.input.is_pressed("w") to check keys. The widget receiving the controller MUST call set_focusable(True) and grab_focus() to actually receive key events.
-- ForgeMouse: Initialize with ForgeMouse(self) inside AppWidget. Provides continuous self.mouse.x and self.mouse.y tracking and self.mouse.is_pressed() functionality.
-- ForgeGameLoop: Constructor is (update_func, fps=60). MUST pass update function positionally or as update_func=. The update_func MUST accept a 'dt' (delta time) argument. If drawing graphics, you MUST call self.drawing_area.queue_draw() inside your update_func so the screen refreshes!
-- FORGE_GAME: To build games, you MUST import classes from the modular components (e.g., from forge_game_textures import ForgeTextureManager, from forge_game_core import ForgeGameLoop, etc).
-- ForgeTileMap Physics: For platformers, encode every solid floor, wall, and platform as positive values in the ForgeTileMap grid. After actor.update(dt), call tile_map.resolve_physics(actor). This resolves tile collisions on both axes, updates actor.is_grounded, and clamps actors to tilemap bounds. Use clamp_bottom=False only for intentional death pits and then handle fall death explicitly.
-- ForgeSprite: NOT a Gtk.Widget. NEVER append it to a container. To render it, create a ForgeDrawingArea(draw_func=...), append the drawing area to your layout, and call sprite.draw(cr) inside the draw_func. To use textures, pass a valid URL or Path to image_path.
-- GTK LAYOUT: Root AppWidget, major panels, AND game/drawing areas MUST call set_hexpand(True) and set_vexpand(True) so they dynamically fill the screen. NEVER leave them unexpanded.
-- ask_ai(system_prompt, user_prompt, callback): Asynchronously queries the active LLM. The callback MUST accept exactly ONE argument (the string response).
-- ask_ai_structured(system_prompt, user_prompt, expected_schema, callback): Forces AI to return JSON matching expected_schema (a python dict). Callback receives a parsed Python dict/list. USE THIS for rich dashboards!
-- fetch_web_image(query, callback): Asynchronously fetches an image URL based on a search query. Callback takes one string argument (the URL). USE THIS FOR ENCYCLOPEDIAS OR DATA DASHBOARDS!
+- ForgeLevelGenerator: MUST BE USED for generating 30+ room levels/BSPs. E.g. grid, rooms, spawns = ForgeLevelGenerator.generate_bsp_dungeon(64, 64). Use the 'spawns' array (contains dicts with 'type', 'x', 'y') to reliably place the player, enemies, weapons, and ammo in empty room spaces.
+- 3D Physics & Interaction: To prevent walking through walls, the Player MUST have width (e.g. 0.4) and height (0.4) and you MUST use ForgeTileMap(grid, tile_size=1).resolve_physics(player). For doors (grid value 2), check the grid cell in front of the player, set to 0 to open, and call tilemap.rebuild_colliders().
+- 3D Pickups & Animations: Implement weapons, ammo, and health pickups by spawning ForgeItem instances from the 'spawns' data. Animate sprites by cycling their texture_id (e.g., using ForgeAnimatedSprite) in the update() loop.
+- Texture Generation: You MUST use the 'generate_texture' native tool to create .png files (e.g., 'assets/brick.png') and load them via 'ForgeTextureManager.get_cairo_surface(os.path.join(os.path.dirname(__file__), "assets/brick.png"))' (ensure you import os). Do NOT hardcode colors/shapes in Python.
+- ForgeRaycaster: For 3D FPS games, use ForgeRaycaster.render(cr, map_data, px, py, dir_x, dir_y, plane_x, plane_y, width, height, textures=tex_dict, sprites=sprite_array). MUST pass a populated textures dictionary (mapping int ID to cairo.ImageSurface) and a list of entities with x, y, and texture_id attributes.
+- ForgeInput: Initialize with self.input = ForgeInput(self) inside AppWidget. Use self.input.is_pressed("w") to check keys.
+- ForgeGameLoop: Constructor is (update_func, fps=60). The update_func MUST accept a 'dt' (delta time) argument. MUST call self.drawing_area.queue_draw() inside your update_func.
+- Game Visual Style: Game AppWidget classes MUST include executable GTK style markers, not only Cairo decoration. Create self.css_provider = Gtk.CssProvider(), load CSS for game-shell/game-hud/game-menu/game-over-screen regions, register it only when Gdk.Display.get_default() returns a display, and call add_css_class or set_name on those real widgets.
 - AppWidget Scoping: All CSS styling (Gtk.CssProvider), Keyboard Controllers (ForgeInput), and Mouse Tracking (ForgeMouse) MUST be applied directly to the AppWidget class. CRITICAL: AppWidget MUST have a parameterless constructor: def __init__(self):
 """
     print(output)
@@ -414,8 +416,8 @@ except Exception as e:
 
     async _runReActLoop(llm, systemPrompt, initialMessage, workspacePath, progressCallback, abortSignal, agentName) {
         let messages = [{ role: 'user', content: initialMessage }];
-        let maxSteps = 30; // Enough runway for generation and repair without runaway correction loops.
-        let toolsInstance = new ForgeTools(workspacePath);
+        let maxSteps = 30;
+        let toolsInstance = new ForgeTools(workspacePath, llm);
         let schemas = toolsInstance.getToolSchemas();
 
         console.warn(`\n========== [DEBUG GNOME-FORGE] PIPELINE INIT: ${agentName} ==========`);
@@ -549,16 +551,17 @@ except Exception as e:
             const deterministicGameAuditContract = `\n\nDETERMINISTIC GAME AUDIT CONTRACT:
 - Implement a dedicated \`restart_game(self, *args)\` method in AppWidget that calls the logic reset method, returns the game to PLAYING/PLAY, hides the game-over overlay, resets visible HUD state where needed, and calls \`self.grab_focus()\`.
 - Wire the visible Game Over button directly as \`ForgeButton(label="Restart"\` or \`"Try Again"\`, \`on_click=self.restart_game\`). A restart-labeled button wired only to an unrelated callback is likely to fail audit.
-- Use a real texture/sprite/image-surface code path for board/entities/background. At least one executable marker must be present and used during rendering: \`cairo.ImageSurface(...)\`, \`ImageSurface(...)\`, \`cairo.SurfacePattern(...)\`, \`SurfacePattern(...)\`, \`cr.set_source_surface(...)\`, \`ForgeSprite(...)\`, \`ForgeTextureManager.get_cairo_surface(...)\`, or \`image_path=\`.
-- Colored rectangles, arcs, grid lines, and comments saying "sprite" are not enough; generate a small procedural Cairo surface in code if no asset exists.`;
+- Add an executable GTK visual style scaffold in AppWidget: instantiate \`Gtk.CssProvider\`, load CSS rules for the game shell/HUD/menu/game-over overlay, register the provider only when \`Gdk.Display.get_default()\` returns a display, and call \`add_css_class\` or \`set_name\` on those regions using audit-visible names such as \`game-shell\`, \`game-overlay\`, \`game-hud\`, \`game-menu\`, and \`game-over-screen\`. Cairo-only sky/cloud/HUD rectangles do not satisfy the visual-style audit.
+- Use a real texture/sprite/image-surface code path for board/entities/background. You MUST use the generate_texture tool to generate real .png asset files, and load them via ForgeTextureManager.get_cairo_surface. Do NOT hardcode procedural shapes in Python.
+- Colored rectangles, arcs, grid lines, and comments saying "sprite" are not enough; generate a PNG asset during the tool execution phase.`;
 
             let uiAgentSystem, logicAgentSystem, uiPrompt, logicPrompt;
 
             if (isGame) {
                 uiAgentSystem = getSystemPrompt('game_ux_agent');
                 logicAgentSystem = getSystemPrompt('gameplay_agent');
-                uiPrompt = `Design the complete 2D/3D game rendering interface based on this specification: ${expansionText}${deterministicGameAuditContract}\nOutput your draft to ${appBaseName}_ui.py. First read the SUCCESS CRITERIA section and treat it as the checklist for done. Import required classes from forge_game_core, forge_game_entities, forge_game_math, forge_game_level, forge_game_textures. Use ForgeDrawingArea for rendering. You MUST capture mouse input via ForgeMouse and keyboard input via ForgeInput. Ensure self.drawing_area.set_size_request(800, 600) is called. You MUST include a Main Menu and Game Over screen overlay (Gtk.Overlay) to start/stop the game, including a visible Restart/Try Again button wired to the reset/restart method. You MUST build a themed visual shell with CSS classes or names, HUD/score areas, and a non-flat background. You MUST use textured rendering for the board/entities/background via ForgeSprite, ForgeTextureManager, image_path sprites, Cairo ImageSurface/SurfacePattern, or generated PNG textures. Sound is optional/deferred for now and must not block completion. You MUST instantiate and apply ForgeCamera when world/camera rendering is appropriate. Follow the API contract provided in the specification.`;
-                logicPrompt = `Design the complete 2D/3D gameplay mechanics, physics, and ForgeGameLoop logic based on this specification: ${expansionText}\nOutput your draft to ${appBaseName}_logic.py. First read the SUCCESS CRITERIA section and treat it as the checklist for done. Import required classes from forge_game_core, forge_game_entities, forge_game_math, forge_game_level, forge_game_textures. Include enemies, triggers, and state appropriate to the game type. Read mouse/keyboard inputs passed from the UI. You MUST implement a state machine (MENU, PLAY, GAMEOVER) plus reset_game/restart_game semantics that restore score, entities, timers, and direction/input state. You SHOULD expose event flags or callbacks for scoring/collection, start/restart, collision, and game over for UI effects, but sound is optional/deferred for now. You MUST implement boundary checks appropriate to the game type to trigger Game Over. Follow the API contract provided in the specification.`;
+                uiPrompt = `Design the complete 2D/3D game rendering interface based on this specification: ${expansionText}${deterministicGameAuditContract}\nOutput your draft to ${appBaseName}_ui.py. First read the SUCCESS CRITERIA section and treat it as the checklist for done. Import required classes from forge_game_core, forge_game_entities, forge_game_math, forge_game_level, forge_game_textures. Use ForgeDrawingArea for rendering. You MUST capture mouse input via ForgeMouse and keyboard input via ForgeInput. Ensure self.drawing_area.set_size_request(800, 600) is called. You MUST include a Main Menu and Game Over screen overlay (Gtk.Overlay) to start/stop the game, including a visible Restart/Try Again button wired to the reset/restart method. You MUST build a themed visual shell with a real Gtk.CssProvider plus CSS classes or names on the game shell, overlay, HUD/score areas, menu, and game-over overlay; the generated source must visibly include Gtk.CssProvider and add_css_class/set_name calls for names like game-shell, game-hud, game-menu, and game-over-screen. You MUST use textured rendering for the board/entities/background via ForgeTextureManager and images generated by the generate_texture tool. Sound is optional/deferred for now and must not block completion. Follow the API contract provided in the specification.`;
+                logicPrompt = `Design the complete 2D/3D gameplay mechanics, physics, and ForgeGameLoop logic based on this specification: ${expansionText}\nOutput your draft to ${appBaseName}_logic.py. First read the SUCCESS CRITERIA section and treat it as the checklist for done. Import required classes from forge_game_core, forge_game_entities, forge_game_math, forge_game_level, forge_game_textures. Include enemies, doors, and decorations as entities. Read mouse/keyboard inputs passed from the UI. You MUST use ForgeLevelGenerator for extensive multi-room generation. You MUST implement a state machine (MENU, PLAY, GAMEOVER) plus reset_game/restart_game semantics that restore score, entities, timers, and direction/input state. You SHOULD expose event flags or callbacks for scoring/collection, start/restart, collision, and game over for UI effects, but sound is optional/deferred for now. Follow the API contract provided in the specification.`;
             } else {
                 uiAgentSystem = getSystemPrompt('ui_agent');
                 logicAgentSystem = getSystemPrompt('logic_agent');
@@ -566,7 +569,6 @@ except Exception as e:
                 logicPrompt = `Design the complete backend data structures, dynamic fetchers, and calculation logic based on this specification: ${expansionText}\nOutput your draft to ${appBaseName}_logic.py. Implement real AI calls with ask_ai or ask_ai_structured whenever the specification asks for AI, semantic search, generated articles, dynamic discovery, or dashboard intelligence. Implement image retrieval with fetch_web_image whenever the specification asks for remote or article images. Do not label keyword matching, hardcoded entries, dummy data, or fallback icons as fulfilling AI/image requirements. Follow the API contract provided in the specification.`;
             }
 
-            // Architecture fix: Execute sequential code generation instead of parallel to preserve context
             progressCallback(0.2, "Executing Logic generation sequentially...");
             
             await this._runReActLoop(llm, logicAgentSystem, logicPrompt, libraryDirPath, (p, msg) => progressCallback(0.2 + (p * 0.2), "[Logic] " + msg), abortSignal, isGame ? 'Gameplay_Agent' : 'Logic_Agent');
@@ -581,7 +583,7 @@ except Exception as e:
             progressCallback(0.6, "Merge Agent integrating outputs...");
 
             let mergeSystem = getSystemPrompt('merge_agent');
-            let mergePrompt = `Start the merging process for ${targetFilename} based on the original specification: '${expansionText}'. ${isGame ? deterministicGameAuditContract : ''}\nYou MUST ensure that the final code is a FULLY functional app/game (no placeholders) and fulfills the SUCCESS CRITERIA plus all stylistic, graphical, texture, restart, overlay, and input requirements. For games, explicitly verify a visible restart/play-again control wired to reset state, non-flat textured rendering, and an intentional styled HUD/background/template. Sound is optional/deferred for now and must not block completion. Verify that 'class AppWidget(Gtk.Box):' is the entrypoint. Cleanly import the generated companion modules as needed; ${appBaseName}_logic.py and ${appBaseName}_ui.py are runtime artifacts and will remain on disk.`;
+            let mergePrompt = `Start the merging process for ${targetFilename} based on the original specification: '${expansionText}'. ${isGame ? deterministicGameAuditContract : ''}\nYou MUST ensure that the final code is a FULLY functional app/game (no placeholders) and fulfills the SUCCESS CRITERIA plus all stylistic, graphical, texture, restart, overlay, and input requirements. For games, explicitly verify a visible restart/play-again control wired to reset state, non-flat textured rendering, and an intentional styled HUD/background/template. Preserve or add the executable GTK style scaffold in the final merged file: Gtk.CssProvider plus add_css_class/set_name calls for game-shell, game-overlay, game-hud, game-menu, and game-over-screen regions. Sound is optional/deferred for now and must not block completion. Verify that 'class AppWidget(Gtk.Box):' is the entrypoint. Cleanly import the generated companion modules as needed; ${appBaseName}_logic.py and ${appBaseName}_ui.py are runtime artifacts and will remain on disk.`;
             
             await this._runReActLoop(llm, mergeSystem, mergePrompt, libraryDirPath, progressCallback, abortSignal, 'Merge_Agent');
 
@@ -657,7 +659,6 @@ CRITICAL MANDATES FOR THE TEST SCRIPT:
             }
         }
 
-        // Final native QA pass as a safety net
         progressCallback(0.85, "Performing final native QA verification pass...");
         let [testOk, testOut, testErr] = await this._runSubprocess(['bash', '-c', `cd "${libraryDirPath}" && python3 ${appBaseName}_test.py`]);
 

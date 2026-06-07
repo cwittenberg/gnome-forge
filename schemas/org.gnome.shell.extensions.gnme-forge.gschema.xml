@@ -9,5 +9,9 @@
       <default>'[{"id":"default-ollama","name":"Local Ollama","provider":"ollama","url":"http://localhost:11434","model":"llama3","apiKey":""}]'</default>
       <summary>Serialized JSON string containing all user-configured profiles</summary>
     </key>
+    <key name="open-forge-shortcut" type="as">
+      <default>['&lt;Super&gt;y']</default>
+      <summary>Keyboard shortcut to open GNOME Forge and focus the prompt field</summary>
+    </key>
   </schema>
 </schemalist>

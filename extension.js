@@ -4,6 +4,9 @@ import St from 'gi://St';
 import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
+import Meta from 'gi://Meta';
+import Pango from 'gi://Pango';
+import Shell from 'gi://Shell';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
@@ -13,6 +16,23 @@ import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 
 import { AgentPipeline } from './agent_pipeline.js';
 import { getProviderInstance } from './llm_provider.js';
+
+const OPEN_FORGE_SHORTCUT = 'open-forge-shortcut';
+
+function formatAppDisplayName(appName) {
+    let name = (appName || '').replace(/\.py$/i, '');
+    name = name.replace(/[_-]?\d{10,}$/g, '');
+    name = name.replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2');
+    name = name.replace(/([a-z0-9])([A-Z])/g, '$1 $2');
+    name = name.replace(/[_-]+/g, ' ');
+    name = name.replace(/\bApp\b$/i, '').trim();
+
+    if (!name) return 'App';
+
+    return name
+        .replace(/\s+/g, ' ')
+        .replace(/\b\w/g, letter => letter.toUpperCase());
+}
 
 const ForgeDBusIface = `
 <node>
@@ -295,6 +315,7 @@ class VibeDialog extends ModalDialog.ModalDialog {
     setFinished(appName, runCallback) {
         this._stopSpin();
         try {
+            const displayName = formatAppDisplayName(appName);
             this._statusLabel.set_text(`Compilation complete!`);
             this._statusLabel.set_style('font-size: 11pt; color: #33d17a; margin-top: 4px;');
             this._icon.set_icon_name('emblem-ok-symbolic');
@@ -302,8 +323,8 @@ class VibeDialog extends ModalDialog.ModalDialog {
             this._progressFill.set_style('height: 6px; background-color: #33d17a; border-radius: 3px; width: 400px;');
             this._quoteLabel.set_text("System fully wired. Standing by.");
             
-            let logEntry = new St.Label({ 
-                text: `> SUCCESS: ${appName} is ready.`, 
+            let logEntry = new St.Label({
+                text: `> SUCCESS: ${displayName} is ready.`,
                 style: 'font-family: monospace; font-size: 10pt; color: #33d17a; font-weight: bold;' 
             });
             this._logBox.add_child(logEntry);
@@ -314,7 +335,7 @@ class VibeDialog extends ModalDialog.ModalDialog {
                     runCallback();
                     this.close();
                 },
-                label: `  Launch ${appName}`,
+                label: `Launch ${displayName}`,
                 default: true
             });
             this.addButton({
@@ -360,6 +381,7 @@ class ForgeIndicator extends PanelMenu.Button {
         this._pipeline = new AgentPipeline(this._extensionPath, this._settings);
         this._currentDialog = null;
         this._runningApps = {};
+        this._pendingReworkAppId = null;
 
         let icon = new St.Icon({
             icon_name: 'applications-engineering-symbolic',
@@ -367,24 +389,68 @@ class ForgeIndicator extends PanelMenu.Button {
         });
         this.add_child(icon);
 
-        this.promptEntry = new St.Entry({
-            hint_text: 'Describe the application behavior...',
-            can_focus: true,
-            style: 'min-width: 360px; padding: 6px; margin: 6px;'
+        let promptBox = new St.BoxLayout({
+            vertical: true,
+            style: 'padding: 4px; width: 360px;'
         });
+
+        this.promptEntry = new St.Entry({
+            hint_text: 'Describe the app you want...',
+            can_focus: true,
+            reactive: true,
+            track_hover: true,
+            style: 'width: 350px; min-height: 30px; padding: 4px; font-size: 11pt;'
+        });
+        this.promptEntry.clutter_text.reactive = true;
+        this.promptEntry.clutter_text.set_single_line_mode(false);
+        this.promptEntry.clutter_text.set_line_wrap(true);
+        this.promptEntry.clutter_text.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR);
+
+        this.promptEntry.connect('button-press-event', () => {
+            this.promptEntry.grab_key_focus();
+            return Clutter.EVENT_PROPAGATE;
+        });
+
+        let promptActionRow = new St.BoxLayout({
+            vertical: false,
+            x_expand: true,
+            style: 'spacing: 4px; margin-top: 4px;'
+        });
+        promptActionRow.add_child(new St.Widget({ x_expand: true }));
+
+        this._vibeButton = new St.Button({
+            style_class: 'button',
+            can_focus: false,
+            reactive: false,
+            accessible_name: 'Execute vibe pipeline',
+            style: 'padding: 4px;'
+        });
+        this._vibeButton.set_child(new St.Icon({
+            icon_name: 'system-run-symbolic',
+            icon_size: 16
+        }));
+        this._vibeButton.connect('clicked', () => {
+            if (this._hasPromptText()) {
+                this._triggerVibePipeline();
+            }
+        });
+
+        promptActionRow.add_child(this._vibeButton);
+        promptBox.add_child(this.promptEntry);
+        promptBox.add_child(promptActionRow);
         
         let entryItem = new PopupMenu.PopupBaseMenuItem({ reactive: false });
-        entryItem.add_child(this.promptEntry);
+        entryItem.add_child(promptBox);
         this.menu.addMenuItem(entryItem);
 
-        let vibeItem = new PopupMenu.PopupMenuItem('  Execute Vibe Pipeline');
-        vibeItem.connect('activate', () => {
-            this._triggerVibePipeline();
-        });
-        this.menu.addMenuItem(vibeItem);
-
         this.promptEntry.clutter_text.connect('activate', () => {
-            this._triggerVibePipeline();
+            if (this._hasPromptText()) {
+                this._triggerVibePipeline();
+            }
+        });
+
+        this.promptEntry.clutter_text.connect('text-changed', () => {
+            this._updatePromptState();
         });
 
         this._vibeListBox = new St.BoxLayout({ vertical: true, style: 'spacing: 8px;' });
@@ -401,7 +467,7 @@ class ForgeIndicator extends PanelMenu.Button {
 
         this._libraryBox = new St.BoxLayout({ vertical: true });
         let scroll = new St.ScrollView({
-            style: 'max-height: 360px; width: 440px;',
+            style: 'max-height: 300px; width: 360px;',
             hscrollbar_policy: St.PolicyType.NEVER,
             vscrollbar_policy: St.PolicyType.AUTOMATIC,
         });
@@ -413,7 +479,13 @@ class ForgeIndicator extends PanelMenu.Button {
         
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
-        let settingsItem = new PopupMenu.PopupMenuItem('  Preferences');
+        let settingsItem = new PopupMenu.PopupBaseMenuItem();
+        settingsItem.add_child(new St.Icon({
+            icon_name: 'preferences-system-symbolic',
+            icon_size: 16,
+            style: 'margin-right: 8px;'
+        }));
+        settingsItem.add_child(new St.Label({ text: 'Settings' }));
         settingsItem.connect('activate', () => {
             this.menu.close();
             if (this._ext && this._ext.openPreferences) {
@@ -429,7 +501,55 @@ class ForgeIndicator extends PanelMenu.Button {
         });
         this.menu.addMenuItem(settingsItem);
 
+        this._updatePromptState();
         this._refreshLibrary();
+    }
+
+    openAndFocusPrompt() {
+        if (!this.menu.isOpen) {
+            this.menu.open();
+        }
+
+        GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+            try {
+                this.promptEntry.grab_key_focus();
+                this.promptEntry.clutter_text.set_cursor_position(this.promptEntry.get_text().length);
+            } catch (e) {
+                console.error(`[GNOME-FORGE-ERROR] Unable to focus prompt: ${e.message}`);
+            }
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _hasPromptText() {
+        const text = (this.promptEntry.get_text() || '').trim();
+        if (!text) return false;
+
+        if (this._pendingReworkAppId && /^\s*Rework\b/i.test(text)) {
+            const colonIndex = text.indexOf(':');
+            return colonIndex !== -1 && text.slice(colonIndex + 1).trim().length > 0;
+        }
+
+        return true;
+    }
+
+    _updatePromptState() {
+        const text = this.promptEntry.get_text() || '';
+
+        if (!/^\s*Rework\b/i.test(text)) {
+            this._pendingReworkAppId = null;
+        }
+
+        const wrappedLines = text.split('\n').reduce((total, line) => {
+            return total + Math.max(1, Math.ceil(line.length / 45));
+        }, 0);
+        const height = Math.min(160, Math.max(30, 20 + wrappedLines * 16));
+        this.promptEntry.set_style(`width: 350px; min-height: ${height}px; max-height: 160px; padding: 4px; font-size: 11pt;`);
+
+        const hasPromptText = this._hasPromptText();
+        this._vibeButton.reactive = hasPromptText;
+        this._vibeButton.can_focus = hasPromptText;
+        this._vibeButton.opacity = hasPromptText ? 255 : 96;
     }
 
     triggerReworkDBus(appName, prompt) {
@@ -443,6 +563,7 @@ class ForgeIndicator extends PanelMenu.Button {
 
     triggerUndoDBus(appName) {
         console.log(`[GNOME-FORGE] DBus Triggered Undo Rework for ${appName}`);
+        const displayName = formatAppDisplayName(appName);
         let libraryDirPath = GLib.build_filenamev([this._extensionPath, 'library']);
         let pyFile = Gio.File.new_for_path(GLib.build_filenamev([libraryDirPath, `${appName}.py`]));
         let bakFile = Gio.File.new_for_path(GLib.build_filenamev([libraryDirPath, `${appName}.py.bak`]));
@@ -450,37 +571,69 @@ class ForgeIndicator extends PanelMenu.Button {
         if (bakFile.query_exists(null)) {
             try {
                 bakFile.copy(pyFile, Gio.FileCopyFlags.OVERWRITE, null, null);
-                Main.notify('GNOME Forge', `Restored ${appName} to previous state.`);
+                Main.notify('GNOME Forge', `Restored ${displayName} to previous state.`);
                 this._runApp(appName);
             } catch (e) {
                 Main.notifyError('GNOME Forge', `Failed to restore backup: ${e.message}`);
             }
         } else {
-            Main.notifyError('GNOME Forge', `No previous context found for ${appName}.`);
+            Main.notifyError('GNOME Forge', `No previous context found for ${displayName}.`);
         }
     }
 
     async _triggerVibePipeline(manualText = null) {
-        const text = manualText || this.promptEntry.get_text();
-        if (!text) return;
-        
-        console.log(`[GNOME-FORGE] Initiating Vibe Pipeline. Prompt: ${text}`);
+        const rawText = manualText ?? this.promptEntry.get_text();
+        const text = (rawText || '').trim();
+        if (!text) {
+            this._updatePromptState();
+            return;
+        }
 
-        if (!manualText) this.promptEntry.set_text('');
+        let pipelineText = text;
+        let displayText = this._formatPromptForDisplay(text);
+
+        if (!manualText && this._pendingReworkAppId && /^\s*Rework\b/i.test(text)) {
+            const colonIndex = text.indexOf(':');
+            const reworkPrompt = colonIndex >= 0 ? text.slice(colonIndex + 1).trim() : '';
+            if (!reworkPrompt) {
+                this._updatePromptState();
+                return;
+            }
+
+            pipelineText = `Rework ${this._pendingReworkAppId}: ${reworkPrompt}`;
+            displayText = `Rework ${formatAppDisplayName(this._pendingReworkAppId)}: ${reworkPrompt}`;
+        }
+        
+        console.log(`[GNOME-FORGE] Initiating Vibe Pipeline. Prompt: ${pipelineText}`);
+
+        if (!manualText) {
+            this.promptEntry.set_text('');
+            this._pendingReworkAppId = null;
+            this._updatePromptState();
+        }
         this.menu.close();
 
         let abortSignal = { cancelled: false };
 
-        let vibeBox = new St.BoxLayout({ vertical: true, style: 'padding: 6px; margin: 6px; width: 348px;' });
+        let vibeBox = new St.BoxLayout({ vertical: true, style: 'padding: 4px; margin: 4px; width: 350px;' });
         let topRow = new St.BoxLayout({ vertical: false, x_expand: true });
         
-        let titleLabel = new St.Label({ 
-            text: text.substring(0, 35) + (text.length > 35 ? '...' : ''), 
+        let titleLabel = new St.Label({
+            text: displayText.substring(0, 35) + (displayText.length > 35 ? '...' : ''),
             x_expand: true, 
             style: 'font-weight: bold; font-size: 10pt;' 
         });
         
-        let cancelBtn = new St.Button({ style_class: 'button', label: ' ', style: 'padding: 2px 6px; color: #ff7b63;' });
+        let cancelBtn = new St.Button({
+            style_class: 'button',
+            accessible_name: 'Cancel pipeline',
+            style: 'padding: 2px 6px; color: #ff7b63;'
+        });
+        cancelBtn.set_child(new St.Icon({
+            icon_name: 'window-close-symbolic',
+            icon_size: 14,
+            style: 'color: #ff7b63;'
+        }));
         cancelBtn.connect('clicked', () => {
             console.log(`[GNOME-FORGE] Pipeline cancelled by user.`);
             abortSignal.cancelled = true;
@@ -522,7 +675,7 @@ class ForgeIndicator extends PanelMenu.Button {
             dlg.open();
 
             await this._pipeline.execute(
-                text,
+                pipelineText,
                 (msg) => { 
                     if (!abortSignal.cancelled) {
                         console.log(`[GNOME-FORGE-NOTIFY] ${msg}`);
@@ -533,7 +686,7 @@ class ForgeIndicator extends PanelMenu.Button {
                     if (abortSignal.cancelled) return;
                     console.log(`[GNOME-FORGE-PROGRESS] ${Math.round(progress*100)}% - ${statusText}`);
                     progressLabel.set_text(statusText);
-                    let trayWidth = Math.floor(348 * progress);
+                    let trayWidth = Math.floor(350 * progress);
                     progressFill.set_style(`height: 4px; background-color: #3584e4; border-radius: 2px; width: ${trayWidth}px; transition-duration: 300ms;`);
                     
                     if (this._currentDialog) {
@@ -542,6 +695,7 @@ class ForgeIndicator extends PanelMenu.Button {
                 },
                 (appName) => {
                     if (abortSignal.cancelled) return;
+                    const displayName = formatAppDisplayName(appName);
                     console.log(`[GNOME-FORGE] Compilation complete for app: ${appName}`);
                     
                     vibeBox.destroy();
@@ -555,6 +709,8 @@ class ForgeIndicator extends PanelMenu.Button {
                     } else {
                         this._runApp(appName);
                     }
+
+                    Main.notify('GNOME Forge', `${displayName} is ready.`);
                 },
                 abortSignal
             );
@@ -570,7 +726,7 @@ class ForgeIndicator extends PanelMenu.Button {
             }
             
             progressLabel.set_text('Error occurred.');
-            progressFill.set_style('height: 4px; background-color: #e01b24; border-radius: 2px; width: 348px;');
+            progressFill.set_style('height: 4px; background-color: #e01b24; border-radius: 2px; width: 350px;');
             
             GLib.timeout_add(GLib.PRIORITY_DEFAULT, 4000, () => {
                 if (vibeBox) vibeBox.destroy();
@@ -578,6 +734,13 @@ class ForgeIndicator extends PanelMenu.Button {
                 return GLib.SOURCE_REMOVE;
             });
         }
+    }
+
+    _formatPromptForDisplay(text) {
+        const match = (text || '').match(/^\s*Rework\s+([^:]+):\s*(.*)$/i);
+        if (!match) return text;
+
+        return `Rework ${formatAppDisplayName(match[1])}: ${match[2]}`;
     }
 
     _checkVibeList() {
@@ -611,36 +774,52 @@ class ForgeIndicator extends PanelMenu.Button {
                 !name.endsWith('_logic.py') && 
                 !name.endsWith('_test.py')) {
                 let appBaseName = name.replace('.py', '');
-                let displayName = appBaseName.replace(/_/g, ' ');
-                displayName = displayName.replace(/\b\w/g, l => l.toUpperCase());
+                let displayName = formatAppDisplayName(appBaseName);
 
                 let appBox = new St.BoxLayout({ vertical: false, style: 'padding: 6px; border-bottom: 1px solid rgba(255,255,255,0.08);' });
                 let appLabel = new St.Label({ text: displayName, x_expand: true, y_align: Clutter.ActorAlign.CENTER });
                 
                 let btnBox = new St.BoxLayout({ vertical: false, style: 'spacing: 4px;' });
 
-                let runBtn = new St.Button({ style_class: 'button', style: 'padding: 6px;' });
+                let runBtn = new St.Button({
+                    style_class: 'button',
+                    accessible_name: `Launch ${displayName}`,
+                    style: 'padding: 6px;'
+                });
                 runBtn.set_child(new St.Icon({ icon_name: 'media-playback-start-symbolic', icon_size: 16 }));
                 runBtn.connect('clicked', () => {
                     this.menu.close();
                     this._runApp(appBaseName);
                 });
                 
-                let reworkBtn = new St.Button({ style_class: 'button', style: 'padding: 6px;' });
+                let reworkBtn = new St.Button({
+                    style_class: 'button',
+                    accessible_name: `Rework ${displayName}`,
+                    style: 'padding: 6px;'
+                });
                 reworkBtn.set_child(new St.Icon({ icon_name: 'document-edit-symbolic', icon_size: 16 }));
                 reworkBtn.connect('clicked', () => {
-                    this.promptEntry.set_text(`Rework ${appBaseName}: `);
-                    this.promptEntry.grab_key_focus();
+                    this._pendingReworkAppId = appBaseName;
+                    this.promptEntry.set_text(`Rework ${displayName}: `);
+                    this.openAndFocusPrompt();
                 });
 
-                let installBtn = new St.Button({ style_class: 'button', style: 'padding: 6px;' });
+                let installBtn = new St.Button({
+                    style_class: 'button',
+                    accessible_name: `Install ${displayName}`,
+                    style: 'padding: 6px;'
+                });
                 installBtn.set_child(new St.Icon({ icon_name: 'emblem-system-symbolic', icon_size: 16 }));
                 installBtn.connect('clicked', () => {
                     this.menu.close();
                     this._installApp(appBaseName);
                 });
 
-                let deleteBtn = new St.Button({ style_class: 'button', style: 'padding: 6px; color: #ff7b63;' });
+                let deleteBtn = new St.Button({
+                    style_class: 'button',
+                    accessible_name: `Delete ${displayName}`,
+                    style: 'padding: 6px; color: #ff7b63;'
+                });
                 deleteBtn.set_child(new St.Icon({ icon_name: 'user-trash-symbolic', icon_size: 16, style: 'color: #ff7b63;' }));
                 deleteBtn.connect('clicked', () => {
                     this._deleteApp(appBaseName);
@@ -661,6 +840,7 @@ class ForgeIndicator extends PanelMenu.Button {
 
     _deleteApp(appName) {
         console.log(`[GNOME-FORGE] Deleting app: ${appName}`);
+        const displayName = formatAppDisplayName(appName);
         let libraryDirPath = GLib.build_filenamev([this._extensionPath, 'library']);
         let pyFile = Gio.File.new_for_path(GLib.build_filenamev([libraryDirPath, `${appName}.py`]));
         if (pyFile.query_exists(null)) pyFile.delete(null);
@@ -670,6 +850,7 @@ class ForgeIndicator extends PanelMenu.Button {
         if (desktopFile.query_exists(null)) desktopFile.delete(null);
 
         this._refreshLibrary();
+        Main.notify('GNOME Forge', `${displayName} was removed.`);
     }
 
     _runApp(appName) {
@@ -692,7 +873,7 @@ class ForgeIndicator extends PanelMenu.Button {
     _installApp(appName) {
         console.log(`[GNOME-FORGE] Installing desktop entry for app: ${appName}`);
         let appHarnessPath = GLib.build_filenamev([this._extensionPath, 'library', 'app_harness.py']);
-        let displayName = appName.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+        let displayName = formatAppDisplayName(appName);
 
         let desktopContent = `[Desktop Entry]
 Type=Application
@@ -731,6 +912,7 @@ export default class ForgeExtension extends Extension {
         this._settings = this.getSettings();
         this._indicator = new ForgeIndicator(this, this._settings);
         Main.panel.addToStatusArea(this.uuid, this._indicator);
+        this._registerOpenShortcut();
 
         this._dbusImpl = Gio.DBusExportedObject.wrapJSObject(ForgeDBusIface, this);
         this._dbusImpl.export(Gio.DBus.session, '/org/gnome/Shell/Extensions/GnomeForge');
@@ -746,7 +928,30 @@ export default class ForgeExtension extends Extension {
             this._dbusImpl.unexport();
             this._dbusImpl = null;
         }
+        try {
+            Main.wm.removeKeybinding(OPEN_FORGE_SHORTCUT);
+        } catch (e) {
+            console.error(`[GNOME-FORGE-ERROR] Failed to remove shortcut: ${e.message}`);
+        }
         this._settings = null;
+    }
+
+    _registerOpenShortcut() {
+        try {
+            Main.wm.addKeybinding(
+                OPEN_FORGE_SHORTCUT,
+                this._settings,
+                Meta.KeyBindingFlags.NONE,
+                Shell.ActionMode.NORMAL | Shell.ActionMode.OVERVIEW,
+                () => {
+                    if (this._indicator) {
+                        this._indicator.openAndFocusPrompt();
+                    }
+                }
+            );
+        } catch (e) {
+            console.error(`[GNOME-FORGE-ERROR] Failed to register shortcut: ${e.message}`);
+        }
     }
 
     ReworkApp(appName, prompt) {
